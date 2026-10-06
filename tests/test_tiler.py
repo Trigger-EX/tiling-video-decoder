@@ -14,10 +14,10 @@ def ffmpeg(*a):
 
 
 def keyframe_times(path):
-    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
-                          "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "packet=pts_time,flags", "-of", "csv=p=0", path],
                          capture_output=True, text=True, check=True).stdout.split()
-    return [round(float(x.strip(",")), 3) for x in out]
+    return sorted(round(float(l.split(",")[0]), 3) for l in out if "K" in l.split(",")[1])
 
 
 class PlanTest(unittest.TestCase):
@@ -30,6 +30,7 @@ class PlanTest(unittest.TestCase):
 
 
 class TilerTest(unittest.TestCase):
+    CODEC = "h264"
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
@@ -38,7 +39,7 @@ class TilerTest(unittest.TestCase):
                "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", cls.src)
         cls.out = os.path.join(cls.tmp.name, "ts")
-        rc = tiler.main([cls.src, cls.out, "--cols", "4", "--rows", "2", "--pad", "16",
+        rc = tiler.main([cls.src, cls.out, "--cols", "4", "--rows", "2", "--pad", "16", "--codec", cls.CODEC, "--preset", "ultrafast",
                          "--base-width", "320", "--bitrate-k", "4000", "--base-bitrate-k", "300"])
         assert rc == 0
         with open(os.path.join(cls.out, "manifest.json")) as f:
@@ -90,6 +91,11 @@ class TilerTest(unittest.TestCase):
 
         self.assertLess(mad(16, 16, 0, 0, 320, 300), 6)            # interior = source top-left
         self.assertLess(mad(0, 16, sw - 16, 0, 16, 300), 8)        # left pad = wrapped right edge
+
+
+class Vp9TilerTest(TilerTest):
+    """Same checks for the VP9 option used by the browser demo."""
+    CODEC = "vp9"
 
 
 if __name__ == "__main__":

@@ -3,3 +3,5 @@ build/
 *.class
 __pycache__/
 local.properties
+demo/tileset/
+demo/sample_360.mp4

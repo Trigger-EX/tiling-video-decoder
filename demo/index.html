@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tiled 360 Decoder</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --line:#2a303a; --text:#e6e9ee; --dim:#8b93a1; --ok:#3ecf8e; --warn:#f5a524; --bad:#ef5350; --accent:#5aa9ff; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px/1.45 system-ui, sans-serif; overflow:hidden; }
+  canvas#view { position:fixed; inset:0; width:100%; height:100%; display:block; cursor:grab; touch-action:none; }
+  canvas#view:active { cursor:grabbing; }
+  .panel { position:fixed; top:12px; right:12px; width:300px; max-height:calc(100% - 24px); overflow:auto; background:color-mix(in srgb, var(--panel) 92%, transparent); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  h1 { font-size:14px; margin:0 0 8px; }
+  .row { display:flex; justify-content:space-between; gap:8px; margin:3px 0; }
+  .row b { font-variant-numeric: tabular-nums; }
+  label.ctl { display:block; margin:8px 0 2px; color:var(--dim); }
+  input[type=range] { width:100%; }
+  .check { display:flex; align-items:center; gap:6px; margin:4px 0; }
+  button { background:var(--accent); color:#06121f; border:0; border-radius:6px; padding:6px 10px; font:inherit; font-weight:600; cursor:pointer; margin:4px 4px 0 0; }
+  button.secondary { background:var(--line); color:var(--text); }
+  #map { width:100%; height:auto; display:block; border:1px solid var(--line); border-radius:6px; margin:8px 0 4px; background:#0b0e13; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 10px; color:var(--dim); font-size:11px; }
+  .legend i { display:inline-block; width:9px; height:9px; margin-right:4px; border-radius:2px; vertical-align:-1px; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:4px 0 6px; }
+  .bar > div { height:100%; background:var(--ok); width:0; transition:width .2s; }
+  #msg { position:fixed; left:50%; top:40%; transform:translateX(-50%); background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 18px; max-width:min(520px, 90vw); display:none; }
+  #hint { position:fixed; left:12px; bottom:12px; color:var(--dim); background:color-mix(in srgb, var(--bg) 70%, transparent); padding:4px 8px; border-radius:6px; }
+  @media (max-width: 700px) { .panel { width:auto; left:12px; max-height:45%; top:auto; bottom:12px; } #hint { display:none; } }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="msg"></div>
+<div id="hint">drag to look · wheel to zoom · arrow keys</div>
+<div class="panel">
+  <h1>Tiled 360 decoder</h1>
+  <div class="row"><span>Decoder slots in use</span><b id="sSlots">–</b></div>
+  <div class="row"><span>Tiles in view / drawn sharp</span><b id="sTiles">–</b></div>
+  <div class="row"><span>Pixels decoded vs full frame</span><b id="sPct">–</b></div>
+  <div class="bar"><div id="pctBar"></div></div>
+  <div class="row"><span>Decode rate</span><b id="sRate">–</b></div>
+  <div class="row"><span>Tile starts · avg join time</span><b id="sJoin">–</b></div>
+  <div class="row"><span>Dropped frames (tiles)</span><b id="sDrop">–</b></div>
+  <div class="row"><span>Tile sync error (max)</span><b id="sSync">–</b></div>
+
+  <canvas id="map" width="288" height="144"></canvas>
+  <div class="legend"><span><i style="background:#3ecf8e"></i>drawn</span><span><i style="background:#f5a524"></i>joining</span><span><i style="background:#5b6472"></i>lingering</span><span><i style="border:1px solid #ef5350"></i>wanted, no slot</span></div>
+
+  <label class="ctl">Decoder budget: <b id="vBudget"></b></label>
+  <input id="budget" type="range" min="1" max="24" value="12">
+  <label class="ctl">Prefetch margin: <b id="vMargin"></b>°</label>
+  <input id="margin" type="range" min="0" max="45" value="10">
+  <label class="ctl">Field of view (vertical): <b id="vFov"></b>°</label>
+  <input id="fov" type="range" min="40" max="120" value="90">
+
+  <div class="check"><input id="tiling" type="checkbox" checked><label for="tiling">Tiling on (off = low-res base layer only)</label></div>
+  <div class="check"><input id="predict" type="checkbox" checked><label for="predict">Prefetch along head motion</label></div>
+  <div class="check"><input id="tint" type="checkbox"><label for="tint">Tint tiles that are decoding</label></div>
+  <button id="play">Pause</button><button id="mute" class="secondary">Unmute</button><button id="tour" class="secondary">Auto tour</button>
+</div>
+<script type="module" src="viewer.js"></script>
+</body>
+</html>

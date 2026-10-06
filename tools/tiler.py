@@ -69,13 +69,17 @@ def padded_source_filter(width, height, pad):
     )
 
 
-def x264_args(codec, gop, bitrate_k, fps):
+def x264_args(codec, gop, bitrate_k, fps, preset="medium"):
     common = ["-pix_fmt", "yuv420p", "-b:v", "%dk" % bitrate_k,
               "-maxrate", "%dk" % int(bitrate_k * 1.5), "-bufsize", "%dk" % (bitrate_k * 2)]
+    if codec == "vp9":  # for browsers/desktops without H.264; keyframes forced onto the same grid
+        return ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "6", "-row-mt", "1",
+                "-lag-in-frames", "0", "-auto-alt-ref", "0", "-g", str(gop), "-keyint_min", str(gop),
+                "-force_key_frames", "expr:gte(t,n_forced*%s)" % (gop / fps)] + common
     if codec == "h264":
-        return ["-c:v", "libx264", "-profile:v", "high", "-preset", "medium", "-bf", "0",
+        return ["-c:v", "libx264", "-profile:v", "high", "-preset", preset, "-bf", "0",
                 "-x264-params", "keyint=%d:min-keyint=%d:scenecut=0:open-gop=0" % (gop, gop)] + common
-    return ["-c:v", "libx265", "-preset", "medium", "-tag:v", "hvc1",
+    return ["-c:v", "libx265", "-preset", preset, "-tag:v", "hvc1",
             "-x265-params", "keyint=%d:min-keyint=%d:scenecut=0:open-gop=0:bframes=0:log-level=error"
             % (gop, gop)] + common
 
@@ -96,14 +100,14 @@ def build(args):
             graph = "%s;[p]crop=%d:%d:%d:%d[t]" % (padded_source_filter(width, height, args.pad),
                                                    cw, ch, c * tw, r * th)
             cmd = ["ffmpeg", "-y", "-v", "error", "-i", args.input, "-filter_complex", graph,
-                   "-map", "[t]", "-an"] + x264_args(args.codec, gop, tile_bitrate, fps) + \
+                   "-map", "[t]", "-an"] + x264_args(args.codec, gop, tile_bitrate, fps, args.preset) + \
                   ["-movflags", "+faststart", os.path.join(args.output, name)]
             jobs.append((name, cmd))
 
     base_cmd = ["ffmpeg", "-y", "-v", "error", "-i", args.input, "-map", "0:v:0"]
     if has_audio(args.input):
         base_cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "128k"]
-    base_cmd += ["-vf", "scale=%d:%d" % (base_w, base_h)] + x264_args(args.codec, gop, args.base_bitrate_k, fps) + \
+    base_cmd += ["-vf", "scale=%d:%d" % (base_w, base_h)] + x264_args(args.codec, gop, args.base_bitrate_k, fps, args.preset) + \
                 ["-movflags", "+faststart", os.path.join(args.output, "base.mp4")]
     jobs.append(("base.mp4", base_cmd))
 
@@ -135,7 +139,8 @@ def main(argv=None):
     p.add_argument("--cols", type=int, default=8)
     p.add_argument("--rows", type=int, default=4)
     p.add_argument("--pad", type=int, default=16, help="border pixels copied from neighbours (default 16)")
-    p.add_argument("--codec", choices=["h264", "hevc"], default="h264")
+    p.add_argument("--codec", choices=["h264", "hevc", "vp9"], default="h264")
+    p.add_argument("--preset", default="medium", help="x264/x265 preset (use veryfast for quick demos)")
     p.add_argument("--gop-seconds", type=float, default=1.0, help="keyframe interval; bounds tile start-up latency")
     p.add_argument("--base-width", type=int, default=1280, help="whole-sphere fallback layer width (2:1)")
     p.add_argument("--bitrate-k", type=int, default=30000, help="budget for the full frame; tiles get their share")

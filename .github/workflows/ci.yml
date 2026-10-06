@@ -12,5 +12,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Tiler tests
         run: python3 -m unittest discover -s tests -v
+      - name: Demo logic tests
+        run: node --test tests/tiling.test.mjs
       - name: Kotlin tests and Android-API compile check
         run: gradle --no-daemon build
