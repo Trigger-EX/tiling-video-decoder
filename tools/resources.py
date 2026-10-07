@@ -157,15 +157,16 @@ def run_low_priority(cmd):
 
 
 def run_jobs(jobs, governor, log=print, poll=0.25, spawn=spawn_low_priority):
-    """Runs [(name, cmd)] under `governor`. Raises RuntimeError on the first failure (after stopping the rest)."""
+    """Runs [(name, cmd)] or [(name, cmd, on_success)] under `governor`; on_success() is called when that job
+    exits cleanly (before the next job is scheduled). Raises RuntimeError on the first failure, after stopping the rest."""
     pending, running, done, started_at = list(jobs), [], 0, time.monotonic()
     total = len(jobs)
 
     def stop_all():
-        for _, p in running:
+        for _, p, _cb in running:
             if p.poll() is None:
                 p.terminate()
-        for _, p in running:
+        for _, p, _cb in running:
             try:
                 p.wait(5)
             except subprocess.TimeoutExpired:
@@ -174,7 +175,7 @@ def run_jobs(jobs, governor, log=print, poll=0.25, spawn=spawn_low_priority):
     try:
         while pending or running:
             for item in list(running):
-                name, p = item
+                name, p, callback = item
                 rc = p.poll()
                 if rc is None:
                     continue
@@ -187,6 +188,8 @@ def run_jobs(jobs, governor, log=print, poll=0.25, spawn=spawn_low_priority):
                 if rc != 0:
                     raise RuntimeError("%s failed (exit %d):\n%s" % (name, rc, err))
                 done += 1
+                if callback:
+                    callback()
                 governor.sample()
                 log("[%d/%d] %s done  | cpu %s, %s free, %d running, %ds elapsed" % (
                     done, total, name,
@@ -198,12 +201,12 @@ def run_jobs(jobs, governor, log=print, poll=0.25, spawn=spawn_low_priority):
                 ok, _ = governor.may_start(len(running))
                 if not ok:
                     break
-                name, cmd = pending.pop(0)
-                running.append((name, spawn(cmd)))
+                name, cmd, *rest = pending.pop(0)
+                running.append((name, spawn(cmd), rest[0] if rest else None))
                 governor.started()
             time.sleep(poll)
     except BaseException:
         stop_all()
-        for _, p in running:
+        for _, p, _cb in running:
             p.err_file.close()
         raise

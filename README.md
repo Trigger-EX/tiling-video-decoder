@@ -27,6 +27,16 @@ python3 demo/run_demo.py --input my360.mp4   # your own equirect video (width/he
 
 Needs python3 and ffmpeg/ffprobe on your PATH, plus any browser with WebGL; nothing else to install.
 Drag to look around (wheel zooms). The first run takes a minute or two while it encodes the 33 small videos.
+Tiles are HEVC by default, as on the headset; if your browser can't decode HEVC (Firefox on Linux, for one) the page
+says so, and `--codec h264` fixes it.
+
+**Nothing is encoded twice.** Finished tilesets are kept in a per-user cache (`~/.cache/tiling-video-decoder`, or
+`%LOCALAPPDATA%` / `~/Library/Caches`; override with `TILING_CACHE_DIR`), in a folder named for the video and the
+settings, so opening the same video again starts instantly. Changing the video file (size or modification time) or a
+setting (codec, grid, preset) builds a new one beside it. An interrupted run resumes: each row of tiles is written under
+a temporary name and only renamed when complete, so a re-run redoes just the unfinished rows. `--rebuild` forces a fresh
+encode, `--no-tile` reopens the last tileset without checking anything, and `--clear-cache` deletes the cache (it refuses
+to delete a directory it didn't create). The cache also holds the generated sample video.
 
 It is the same method as the headset design: the whole-sphere `base.mp4` plays as the master clock; a pool of
 `<video>` "decoder slots" is pointed at only the tiles you can see (plus a prefetch margin and a short look-ahead
@@ -56,9 +66,8 @@ player repo's measurements (Go) and general browser/GPU support, not from tests 
 
 **HEVC is the default for `tools/tiler.py`**: the Go's hardware decoders are AVC and HEVC only (per `docs/EXECUTION_PLAN.md`
 in the player repo), and HEVC is the one that helps with the headsets' storage and transfer limits. H.264 stays
-available (`--codec h264`) and is what the browser demo picks by default (`--codec auto`), because Firefox on Linux and
-some other browsers cannot decode HEVC; the viewer says so instead of failing silently. In Chrome, Edge or Safari run the
-demo with `--codec hevc` to test the headset build. VP9 is a fallback for browsers without H.264; AV1 is not recommended.
+available (`--codec h264`) and is available for browsers that cannot decode HEVC (Firefox on Linux, for one); the viewer
+says so instead of failing silently and names the flag. `demo/run_demo.py` also defaults to HEVC so it matches the headset build. VP9 is a fallback for browsers without H.264; AV1 is not recommended.
 
 **Caveat on the quality column:** the only footage available when this was measured was a synthetic clip, which is too
 noisy to separate the codecs by much (all within about 0.025 SSIM; AV1 is slightly ahead at low bitrate). The usual
@@ -97,8 +106,8 @@ the Windows and macOS sampling paths are written but untested).
 ```
 python3 demo/run_demo.py --analyze                      # sample world, then benchmark and report
 python3 demo/run_demo.py --analyze --input my360.mp4    # your own video
-python3 demo/run_demo.py --analyze --no-tile            # re-run on the existing tileset
-python3 demo/run_demo.py --analyze --codec hevc --duration 30 --rounds 3
+python3 demo/run_demo.py --analyze                       # run it again on the same video: the cached tileset is reused
+python3 demo/run_demo.py --analyze --duration 30 --rounds 3
 ```
 
 Opens the viewer in benchmark mode and runs it through a scripted head path (the same path every time, default

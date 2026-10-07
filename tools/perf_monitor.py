@@ -175,7 +175,9 @@ def dir_size(path):
     total = 0
     for root, _, files in os.walk(path):
         for f in files:
-            total += os.path.getsize(os.path.join(root, f))
+            fp = os.path.join(root, f)
+            if not os.path.islink(fp):                  # e.g. source.mp4 links to the original video
+                total += os.path.getsize(fp)
     return total
 
 

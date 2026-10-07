@@ -80,6 +80,16 @@ class RunJobsTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "(?s)boom failed.*nope"):
             resources.run_jobs(bad, g, log=lambda *_: None, poll=0.01)
 
+    def test_success_callback_runs_only_for_jobs_that_exit_cleanly(self):
+        g = resources.Governor(sampler=FakeSampler(busy=0.0), cooldown=0)
+        published = []
+        good = ("good", [sys.executable, "-c", "pass"], lambda: published.append("good"))
+        resources.run_jobs([good], g, log=lambda *_: None, poll=0.01)
+        bad = ("bad", [sys.executable, "-c", "import sys; sys.exit(1)"], lambda: published.append("bad"))
+        with self.assertRaises(RuntimeError):
+            resources.run_jobs([bad], g, log=lambda *_: None, poll=0.01)
+        self.assertEqual(published, ["good"])                  # a failed job's output is never published
+
     @unittest.skipIf(os.name == "nt", "nice values are POSIX")
     def test_jobs_run_at_low_priority(self):
         p = resources.spawn_low_priority([sys.executable, "-c", "import os; print(os.nice(0))"])
@@ -87,6 +97,7 @@ class RunJobsTest(unittest.TestCase):
         # nice(0) returns the current niceness; read it from /proc instead of stdout (stdout is discarded)
         q = resources.spawn_low_priority([sys.executable, "-c", "import os,sys; sys.exit(os.nice(0))"])
         self.assertEqual(q.wait(), 15)
+        q.err_file.close()
 
 
 if __name__ == "__main__":

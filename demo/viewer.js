@@ -19,7 +19,7 @@ if (!gl) { msg('WebGL is not available in this browser.'); throw new Error('no w
 
 const MIME = { h264: 'video/mp4; codecs="avc1.640028"', hevc: 'video/mp4; codecs="hvc1.1.6.L120.90"', vp9: 'video/mp4; codecs="vp09.00.40.08"', av1: 'video/mp4; codecs="av01.0.08M.08"' };
 if (!document.createElement('video').canPlayType(MIME[manifest.codec] || '')) {
-  msg(`This browser cannot decode ${manifest.codec.toUpperCase()} video. Use Chrome, Edge or Safari (with a GPU that supports it), or re-tile with --codec h264.`);
+  msg(`This browser cannot decode ${manifest.codec.toUpperCase()} video. Use Chrome, Edge or Safari, or run: python3 demo/run_demo.py --codec h264`);
   throw new Error('codec unsupported');
 }
 const sourceUrl = params.get('source') || 'source.mp4';

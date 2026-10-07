@@ -3,7 +3,8 @@
 
     python3 demo/run_demo.py                      # generates a 3840x1920 test video, tiles it, opens the viewer
     python3 demo/run_demo.py --input my360.mp4    # your own equirect video (size must divide into the grid)
-    python3 demo/run_demo.py --no-tile            # reuse the tileset from the last run
+    python3 demo/run_demo.py                      # run it again: reuses the finished tileset (cached per video + settings)
+    python3 demo/run_demo.py --no-tile            # open the tileset from the last run without even checking the video
     python3 demo/run_demo.py --analyze            # also benchmark tiled vs normal playback and write a report
 
 Needs: python3, ffmpeg + ffprobe on PATH, and a browser with WebGL (Chrome, Edge, Firefox, Safari).
@@ -20,6 +21,7 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 sys.path.insert(0, HERE)
+import cachedir  # noqa: E402
 import perf_monitor  # noqa: E402
 import resources  # noqa: E402
 import serve  # noqa: E402
@@ -41,7 +43,7 @@ def make_sample(path, width, height, seconds, codec="h264"):
            "-f", "lavfi", "-i", "sine=frequency=330:duration=%d" % seconds]
     video = (["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "6", "-crf", "20", "-b:v", "0"] if codec == "vp9"
              else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16"])
-    enc = video + ["-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-shortest", path]
+    enc = video + ["-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-shortest", "-f", "mp4", path]
     threads = ["-threads", str(max(1, (os.cpu_count() or 2) // 2))]   # half the cores, at low priority
     for vf in (grid + "," + labels, grid):
         rc, err = resources.run_low_priority(["ffmpeg", "-y", "-v", "error"] + threads + src + ["-vf", vf] + enc)
@@ -50,16 +52,20 @@ def make_sample(path, width, height, seconds, codec="h264"):
     raise RuntimeError("could not generate the sample video: " + err[-500:])
 
 
-def link_source(path):
-    """Expose the original video to the viewer as demo/source.mp4 (for the 'normal playback' mode)."""
-    dest = os.path.join(HERE, "source.mp4")
+def link_source(dest_dir, path):
+    """Expose the original video next to its tileset as source.mp4 (the viewer's 'normal playback' mode)."""
+    dest = os.path.join(dest_dir, "source.mp4")
+    target = os.path.abspath(path)
+    if os.path.islink(dest) and os.path.realpath(dest) == os.path.realpath(target):
+        return dest
     if os.path.lexists(dest):
         os.remove(dest)
     try:
-        os.symlink(os.path.abspath(path), dest)
+        os.symlink(target, dest)
     except OSError:                       # e.g. Windows without symlink rights
         import shutil
         shutil.copyfile(path, dest)
+    return dest
 
 
 def analyze(a, server, url, tileset_dir, source):
@@ -70,7 +76,7 @@ def analyze(a, server, url, tileset_dir, source):
     print("\nbenchmark: %d windows of %ds (about %d s). Close other programs, keep the browser tab in the foreground\n"
           "and don't touch the mouse. Plug in or unplug consistently; battery power is only recorded when unplugged." % (windows, a.duration, est))
     mon = perf_monitor.Monitor().start()
-    bench_url = "%s?bench=1&duration=%d&rounds=%d" % (url, a.duration, a.rounds)
+    bench_url = "%s&bench=1&duration=%d&rounds=%d" % (url, a.duration, a.rounds)
     if not a.no_open:
         webbrowser.open(bench_url)
     else:
@@ -84,7 +90,7 @@ def analyze(a, server, url, tileset_dir, source):
     finally:
         mon.stop()
     path, bench = server.perf_results[-1]
-    report = perf_monitor.build_report(bench, mon.rows, mon.cores, tileset_dir, os.path.join(HERE, "source.mp4"))
+    report = perf_monitor.build_report(bench, mon.rows, mon.cores, tileset_dir, source)
     rpath = path.replace("bench-", "report-").replace(".json", ".md")
     with open(rpath, "w") as f:
         f.write(report)
@@ -95,20 +101,36 @@ def analyze(a, server, url, tileset_dir, source):
     return 0
 
 
+def sample_path(root, a):
+    """A generated sample is kept in the cache and reused; written under a temporary name so it is never half-made."""
+    w, h = (int(x) for x in a.size.split("x"))
+    codec = "vp9" if a.codec == "vp9" else "h264"
+    path = os.path.join(root, "samples", "sample-%dx%d-%ds-%s.mp4" % (w, h, a.seconds, codec))
+    if os.path.exists(path):
+        print("using cached sample video %s" % path)
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    make_sample(path + ".part", w, h, a.seconds, codec)
+    os.replace(path + ".part", path)
+    return path
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", help="equirectangular 360 video (default: generate a test video)")
     p.add_argument("--cols", type=int, default=8)
     p.add_argument("--rows", type=int, default=4)
-    p.add_argument("--codec", choices=("auto",) + tiler.CODECS, default="auto",
-                   help="tile codec. auto = h264, which every browser decodes; use hevc in Chrome/Edge/Safari to match the headset")
+    p.add_argument("--codec", choices=tiler.CODECS, default="hevc",
+                   help="tile codec (default hevc, as on the headset). If your browser cannot decode HEVC (e.g. Firefox on Linux) use h264")
     p.add_argument("--preset", choices=tiler.PRESETS, default="fast", help="encode speed/quality tier (default: fast)")
     p.add_argument("--headroom", type=float, default=0.30, help="fraction of CPU kept free for other programs (default 0.30)")
     p.add_argument("--no-throttle", action="store_true", help="use every core at full speed (can make the desktop stutter)")
     p.add_argument("--seconds", type=int, default=20, help="length of the generated sample")
     p.add_argument("--size", default="3840x1920", help="size of the generated sample")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--no-tile", action="store_true", help="skip tiling, reuse demo/tileset")
+    p.add_argument("--no-tile", action="store_true", help="skip tiling; open the tileset from the last run")
+    p.add_argument("--rebuild", action="store_true", help="ignore the cached tileset and encode again")
+    p.add_argument("--clear-cache", action="store_true", help="delete all cached tilesets and samples, then exit")
     p.add_argument("--no-open", action="store_true", help="do not open a browser")
     p.add_argument("--analyze", action="store_true", help="run the tiled-vs-normal benchmark, record system load, write a report, exit")
     p.add_argument("--duration", type=int, default=20, help="seconds per benchmark window (default 20)")
@@ -116,33 +138,45 @@ def main():
     p.add_argument("--reference", help="original video for normal playback if --input is not playable in the browser")
     a = p.parse_args()
 
-    if a.codec == "auto":
-        a.codec = "h264"
-        print("codec: h264 (plays in every browser; use --codec hevc in Chrome/Edge/Safari to match the headset build)")
-    out = os.path.join(HERE, "tileset")
-    src = a.input
-    if not a.no_tile:
-        if not src:
-            src = os.path.join(HERE, "sample_360.mp4")
-            w, h = (int(x) for x in a.size.split("x"))
-            make_sample(src, w, h, a.seconds, "vp9" if a.codec == "vp9" else "h264")
-        print("tiling into %dx%d tiles (this encodes %d small videos)..." % (a.cols, a.rows, a.cols * a.rows + 1))
+    root = cachedir.cache_root()
+    if a.clear_cache:
+        print("deleted %.0f MB from %s" % (cachedir.clear_cache(root), root))
+        return 0
+    tilesets_root = os.path.join(root, "tilesets")
+    os.makedirs(tilesets_root, exist_ok=True)
+    latest = os.path.join(root, "latest.json")
+
+    if a.no_tile:
+        try:
+            with open(latest) as f:
+                last = json.load(f)
+        except (OSError, ValueError):
+            print("no tileset from a previous run; run without --no-tile first", file=sys.stderr)
+            return 1
+        name, src = last["name"], last["source"]
+        out = os.path.join(tilesets_root, name)
+    else:
+        src = a.input or sample_path(root, a)
+        name = cachedir.tileset_name(src, a.codec, a.cols, a.rows, a.preset)
+        out = os.path.join(tilesets_root, name)
+        print("tileset: %s" % out)
         rc = tiler.main([src, out, "--cols", str(a.cols), "--rows", str(a.rows), "--codec", a.codec,
                          "--preset", a.preset, "--bitrate-k", "16000", "--base-bitrate-k", "1500"] +
-                        (["--no-throttle"] if a.no_throttle else ["--headroom", str(a.headroom)]))
+                        (["--no-throttle"] if a.no_throttle else ["--headroom", str(a.headroom)]) +
+                        (["--rebuild"] if a.rebuild else []))
         if rc:
             return rc
-    elif not os.path.exists(os.path.join(out, "manifest.json")):
-        print("no tileset found; run without --no-tile first", file=sys.stderr)
-        return 1
+        with open(latest, "w") as f:
+            json.dump({"name": name, "source": os.path.abspath(src)}, f)
 
-    src = src or os.path.join(HERE, "sample_360.mp4")
-    link_source(a.reference or src)
-
-    server = serve.make_server(HERE, a.port)
-    url = "http://127.0.0.1:%d/index.html" % a.port
+    if a.codec == "hevc":
+        print("note: HEVC needs a browser that can decode it (Chrome, Edge, Safari). On Firefox for Linux use: run_demo.py --codec h264")
+    source_link = link_source(out, a.reference or src)
+    server = serve.make_server(HERE, a.port, mounts={"/tilesets": tilesets_root})
+    url = "http://127.0.0.1:%d/index.html?tileset=tilesets/%s&source=tilesets/%s/source.mp4" % (a.port, name, name)
+    print("cache: %.0f MB in %s  (python3 demo/run_demo.py --clear-cache to delete)" % (cachedir.size_mb(root), root))
     if a.analyze:
-        return analyze(a, server, url, out, a.reference or src)
+        return analyze(a, server, url, out, source_link)
     print("\nviewer: %s   (Ctrl+C to stop)" % url)
     if not a.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

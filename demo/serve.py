@@ -2,10 +2,12 @@
 import http.server
 import json
 import os
+import posixpath
 import re
 import sys
 import threading
 import time
+import urllib.parse
 
 
 class RangeHandler(http.server.SimpleHTTPRequestHandler):
@@ -16,6 +18,15 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
+
+    def translate_path(self, path):
+        """Like the base class, plus `server.mounts` ({"/prefix": directory}) for files that live outside the web root."""
+        clean = urllib.parse.urlsplit(path).path
+        for prefix, root in getattr(self.server, "mounts", {}).items():
+            if clean.startswith(prefix + "/"):
+                rel = posixpath.normpath(urllib.parse.unquote(clean[len(prefix):])).lstrip("/")   # normpath: no ".." escapes
+                return os.path.join(root, *[part for part in rel.split("/") if part])
+        return super().translate_path(path)
 
     def do_POST(self):
         """Receives benchmark results from the viewer (POST /__perf) and stores them under perf/."""
@@ -81,9 +92,10 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
             pass  # the browser cancelled the request (it does this when seeking)
 
 
-def make_server(directory, port):
+def make_server(directory, port, mounts=None):
     handler = lambda *a, **k: RangeHandler(*a, directory=directory, **k)  # noqa: E731
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    server.mounts = dict(mounts or {})
     server.perf_results = []              # (path, parsed json) of every benchmark the viewer posted
     server.perf_event = threading.Event()
     return server
