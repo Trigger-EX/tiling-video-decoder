@@ -96,3 +96,17 @@ export class Scheduler {
     return { start: [...keep].filter((k) => !active.has(k)), stop: [...active].filter((k) => !keep.has(k)) };
   }
 }
+
+/** Share (0..1) of the view, by ray count, that lands in a tile in `readyKeys` (a Set of tileKey strings). */
+export function readyCoverage(grid, view, halfH, halfV, readyKeys, raysPerAxis = 25) {
+  const tx = Math.tan(halfH), ty = Math.tan(halfV), m = rotation(view.yaw, view.pitch);
+  let hit = 0;
+  for (let i = 0; i < raysPerAxis; i++) {
+    const sx = -1 + (2 * i) / (raysPerAxis - 1);
+    for (let j = 0; j < raysPerAxis; j++) {
+      const sy = -1 + (2 * j) / (raysPerAxis - 1), v = [tx * sx, ty * sy, -1], n = Math.hypot(...v);
+      if (readyKeys.has(tileKey(grid.tileAt(apply(m, [v[0] / n, v[1] / n, v[2] / n]))))) hit++;
+    }
+  }
+  return hit / (raysPerAxis * raysPerAxis);
+}

@@ -1,8 +1,11 @@
 """Tiny static file server with HTTP Range support (browsers need it to seek in <video>)."""
 import http.server
+import json
 import os
 import re
 import sys
+import threading
+import time
 
 
 class RangeHandler(http.server.SimpleHTTPRequestHandler):
@@ -13,6 +16,27 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
+
+    def do_POST(self):
+        """Receives benchmark results from the viewer (POST /__perf) and stores them under perf/."""
+        if self.path != "/__perf":
+            return self.send_error(404)
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0 or n > 2_000_000:
+            return self.send_error(413)
+        try:
+            data = json.loads(self.rfile.read(n))
+        except ValueError:
+            return self.send_error(400)
+        out_dir = os.path.join(self.directory, "perf")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "bench-%d.json" % int(time.time()))
+        with open(path, "w") as f:
+            json.dump(data, f, indent=1)
+        self.server.perf_results.append((path, data))
+        self.server.perf_event.set()
+        self.send_response(204)
+        self.end_headers()
 
     def send_head(self):
         rng = self.headers.get("Range")
@@ -59,7 +83,10 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
 
 def make_server(directory, port):
     handler = lambda *a, **k: RangeHandler(*a, directory=directory, **k)  # noqa: E731
-    return http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    server.perf_results = []              # (path, parsed json) of every benchmark the viewer posted
+    server.perf_event = threading.Event()
+    return server
 
 
 if __name__ == "__main__":

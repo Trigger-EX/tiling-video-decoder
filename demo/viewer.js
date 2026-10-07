@@ -1,4 +1,5 @@
-import { Grid, planVisible, Scheduler, rotation, apply, tileKey, rad } from './tiling.js';
+import { Grid, planVisible, Scheduler, rotation, apply, tileKey, rad, readyCoverage } from './tiling.js';
+import { FrameStats, TimeMean, benchOrder, decodedMpxPerSecond } from './perf.js';
 
 const params = new URLSearchParams(location.search);
 const base = (params.get('tileset') || 'tileset').replace(/\/$/, '') + '/';
@@ -16,6 +17,14 @@ try {
 }
 if (!gl) { msg('WebGL is not available in this browser.'); throw new Error('no webgl'); }
 
+const MIME = { h264: 'video/mp4; codecs="avc1.640028"', hevc: 'video/mp4; codecs="hvc1.1.6.L120.90"', vp9: 'video/mp4; codecs="vp09.00.40.08"', av1: 'video/mp4; codecs="av01.0.08M.08"' };
+if (!document.createElement('video').canPlayType(MIME[manifest.codec] || '')) {
+  msg(`This browser cannot decode ${manifest.codec.toUpperCase()} video. Use Chrome, Edge or Safari (with a GPU that supports it), or re-tile with --codec h264.`);
+  throw new Error('codec unsupported');
+}
+const sourceUrl = params.get('source') || 'source.mp4';
+let sourceOk = !!(await fetch(sourceUrl, { method: 'HEAD' }).catch(() => null))?.ok;
+
 const g = manifest.grid;
 const grid = new Grid(g.cols, g.rows, g.tileWidth, g.tileHeight, g.pad);
 const fileOf = Object.fromEntries(manifest.tiles.map((t) => [tileKey(t), t.file]));
@@ -31,6 +40,25 @@ function makeVideo() {
 }
 const baseVideo = makeVideo();
 baseVideo.src = base + manifest.base.file;
+// "Normal playback": the original video, one decoder, drawn on the same sphere. Used for comparisons.
+const sourceVideo = makeVideo();
+sourceVideo.addEventListener('error', () => { sourceOk = false; $('modeFull').disabled = true; });
+let mode = 'tiled';
+let muted = true;
+const clockVideo = () => (mode === 'full' ? sourceVideo : baseVideo);
+
+// Decoder frame counters are per <video> load, so keep totals from videos we have unloaded.
+const done = { dropped: 0, total: 0 };
+function harvest(v) { const q = v.getVideoPlaybackQuality?.(); if (q) { done.dropped += q.droppedVideoFrames; done.total += q.totalVideoFrames; } }
+function videoCounters() {
+  let dropped = done.dropped, total = done.total;
+  for (const v of [baseVideo, sourceVideo, ...slots.map((x) => x.video)]) {
+    if (!v.getAttribute('src')) continue;
+    const q = v.getVideoPlaybackQuality?.(); if (q) { dropped += q.droppedVideoFrames; total += q.totalVideoFrames; }
+  }
+  return { dropped, total };
+}
+function unload(v) { harvest(v); v.pause(); v.removeAttribute('src'); v.load(); }
 
 // A slot is one decoder instance: a <video> element that is pointed at different tiles. Releasing
 // a slot (removing its src) frees the browser's hardware decoder, which is the point of tiling.
@@ -58,7 +86,7 @@ function assign(s, key) {
   stats.starts++;
 }
 function release(s) {
-  s.video.pause(); s.video.removeAttribute('src'); s.video.load();
+  unload(s.video);
   s.tile = null; s.key = null; s.ready = false;
 }
 
@@ -114,6 +142,7 @@ const patches = new Map(grid.all().map((t) => {
   return [tileKey(t), patch(a0, a1, e0, e1, inner, 12, 12)];
 }));
 const baseTexture = createTexture();
+const sourceTexture = createTexture();
 
 function draw(mesh, texture, tint) {
   gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -163,18 +192,22 @@ function setFov(d) { d = Math.max(40, Math.min(120, d)); $('fov').value = d; fov
 $('fov').oninput = (e) => setFov(e.target.valueAsNumber);
 $('budget').oninput = (e) => setBudget(e.target.valueAsNumber);
 $('margin').oninput = (e) => { $('vMargin').textContent = e.target.value; };
-$('play').onclick = () => { playing = !playing; $('play').textContent = playing ? 'Pause' : 'Play'; for (const v of [baseVideo, ...slots.map((s) => s.video)]) { if (!v.src) continue; playing ? v.play().catch(() => {}) : v.pause(); } };
-$('mute').onclick = () => { baseVideo.muted = !baseVideo.muted; $('mute').textContent = baseVideo.muted ? 'Unmute' : 'Mute'; };
+$('play').onclick = () => { playing = !playing; $('play').textContent = playing ? 'Pause' : 'Play'; for (const v of [baseVideo, sourceVideo, ...slots.map((s) => s.video)]) { if (!v.getAttribute('src')) continue; playing ? v.play().catch(() => {}) : v.pause(); } };
+$('mute').onclick = () => { muted = !muted; baseVideo.muted = sourceVideo.muted = muted; $('mute').textContent = muted ? 'Unmute' : 'Mute'; };
 $('tour').onclick = () => { tourOn = !tourOn; tourT = 0; };
 let tourT = 0;
+// The same head path every time, so two runs (or two modes) see identical motion.
+const tourPose = (t) => ({ yaw: rad(110) * Math.sin(t * 0.55) + t * 0.35, pitch: rad(40) * Math.sin(t * 0.8) });
 setFov(90); $('vMargin').textContent = $('margin').value; setBudget(12);
 baseVideo.play().catch(() => msg('Click anywhere to start playback.'));
-addEventListener('pointerdown', () => { msg(''); if (playing) baseVideo.play().catch(() => {}); }, { once: true });
+addEventListener('pointerdown', () => { msg(''); if (playing) clockVideo().play().catch(() => {}); }, { once: true });
 
 // ---------------------------------------------------------------- per-frame work
 let lastPlan = 0, last = performance.now(), lastYaw = yaw, lastPitch = pitch, fpsCount = 0, fpsT = 0, shownFps = 0;
 
+let sharpNow = true, areaNow = 1, needNow = [], tourSpeed = 1;
 function updateSlots(now) {
+  if (mode === 'full') { wantedTiles = []; sharpNow = true; areaNow = 1; return; }
   const tilingOn = $('tiling').checked;
   // Plan a few times per second, not every frame.
   if (now - lastPlan > 100) {
@@ -184,11 +217,14 @@ function updateSlots(now) {
     const views = [{ yaw, pitch }];
     if ($('predict').checked) views.push({ yaw: yaw + vel.yaw * 0.4, pitch: clampPitch(pitch + vel.pitch * 0.4) });
     wantedTiles = tilingOn ? planVisible(grid, views, halfH, halfV, rad($('margin').valueAsNumber)) : [];
+    needNow = planVisible(grid, [{ yaw, pitch }], halfH, halfV, 0).map(tileKey);   // tiles actually on screen
+    areaNow = tilingOn ? readyCoverage(grid, { yaw, pitch }, halfH, halfV, new Set(slots.filter((s) => s.key && s.ready).map((s) => s.key))) : 0;
     const active = new Set(slots.filter((s) => s.key).map((s) => s.key));
     const d = scheduler.update(now, wantedTiles, active);
     for (const k of d.stop) release(slots.find((s) => s.key === k));
     for (const k of d.start) assign(slots.find((s) => !s.key), k);
   }
+  { const ready = new Set(slots.filter((s) => s.key && s.ready).map((s) => s.key)); sharpNow = tilingOn && needNow.every((k) => ready.has(k)); }
   const clock = baseVideo.currentTime, dur = baseVideo.duration || manifest.durationSeconds;
   let maxSync = 0;
   for (const s of slots) {
@@ -207,6 +243,7 @@ function updateSlots(now) {
     const q = v.getVideoPlaybackQuality?.(); if (q) s.dropped = q.droppedVideoFrames;
   }
   stats.maxSync = maxSync;
+  if (win.active) win.maxSync = Math.max(win.maxSync, maxSync);
 }
 
 function upload(texture, video, dirty) {
@@ -216,10 +253,10 @@ function upload(texture, video, dirty) {
 }
 
 function frame(now) {
-  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  const rawMs = now - last, dt = Math.min(0.1, rawMs / 1000); last = now;
   if (tourOn) {                                    // repeatable head sweep: look around, up and down, then behind
-    tourT += dt;
-    yaw = rad(110) * Math.sin(tourT * 0.55) + tourT * 0.35; pitch = rad(40) * Math.sin(tourT * 0.8);
+    tourT += dt * tourSpeed;
+    ({ yaw, pitch } = tourPose(tourT));
   }
   if (dt > 0) {                                     // smoothed head velocity for prefetch
     const k = 0.2;
@@ -235,9 +272,9 @@ function frame(now) {
   gl.useProgram(prog);
   gl.uniformMatrix4fv(loc.mvp, false, mvp(yaw, pitch, fovV, w / h));
 
-  upload(baseTexture, baseVideo, true);
-  draw(sphere, baseTexture, [0, 0, 0, 0]);
   let drawn = 0;
+  if (mode === 'full') { upload(sourceTexture, sourceVideo, true); draw(sphere, sourceTexture, [0, 0, 0, 0]); }
+  else { upload(baseTexture, baseVideo, true); draw(sphere, baseTexture, [0, 0, 0, 0]); }
   const tint = $('tint').checked ? [0.1, 0.9, 0.5, 0.22] : [0, 0, 0, 0];
   for (const s of slots) {
     if (!s.key || !s.ready) continue;
@@ -245,6 +282,12 @@ function frame(now) {
     draw(patches.get(s.key), s.texture, tint); drawn++;
   }
   stats.tilesDrawn = drawn;
+  if (win.active) {
+    win.frames.add(rawMs);
+    win.slots.add(mode === 'full' ? 0 : slots.filter((s) => s.key).length, dt);
+    win.sharp.add(sharpNow ? 1 : 0, dt);
+    win.area.add(areaNow, dt);
+  }
   fpsCount++; fpsT += dt; if (fpsT > 1) { shownFps = fpsCount / fpsT; fpsCount = 0; fpsT = 0; }
   updatePanel(now);
   requestAnimationFrame(frame);
@@ -256,7 +299,7 @@ function updatePanel(now) {
   const active = slots.filter((s) => s.key);
   const codedPx = grid.codedWidth * grid.codedHeight;
   const basePx = manifest.base.width * manifest.base.height;
-  const decodedPx = (active.length * codedPx + basePx) * fps, fullPx = grid.width * grid.height * fps;
+  const fullPx = grid.width * grid.height * fps, decodedPx = mode === 'full' ? fullPx : (active.length * codedPx + basePx) * fps;
   const pct = (100 * decodedPx) / fullPx;
   $('sSlots').textContent = `${active.length} / ${slots.length}`;
   $('sTiles').textContent = `${Math.min(wantedTiles.length, 999)} / ${stats.tilesDrawn}`;
@@ -284,3 +327,102 @@ function updatePanel(now) {
 }
 requestAnimationFrame(frame);
 window.__demo = { setTour: (on) => { tourOn = on; tourT = 0; }, setView: (y, p) => { tourOn = false; yaw = y; pitch = p; } };
+
+// ---------------------------------------------------------------- mode switching and benchmark
+const win = { active: false, maxSync: 0 };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function setMode(m) {
+  if (m === mode) return true;
+  if (m === 'full' && !sourceOk) { msg(`Normal playback needs the original video at ${sourceUrl} (run_demo.py links it automatically).`); return false; }
+  const t = clockVideo().currentTime;
+  mode = m;
+  $('modeFull').checked = m === 'full'; $('modeTiled').checked = m === 'tiled';
+  for (const s of slots) if (s.key) release(s);
+  const [target, other] = m === 'full' ? [sourceVideo, baseVideo] : [baseVideo, sourceVideo];
+  unload(other);
+  target.muted = muted;
+  target.src = m === 'full' ? sourceUrl : base + manifest.base.file;
+  await new Promise((r) => { target.addEventListener('loadedmetadata', r, { once: true }); target.addEventListener('error', r, { once: true }); });
+  if (!sourceOk && m === 'full') { await setMode('tiled'); return false; }
+  target.currentTime = t % (target.duration || t + 1);
+  if (playing) await target.play().catch(() => {});
+  await new Promise((r) => ('requestVideoFrameCallback' in target ? target.requestVideoFrameCallback(() => r()) : setTimeout(r, 400)));
+  return true;
+}
+
+function perfStart(meta) {
+  Object.assign(win, { active: true, meta, frames: new FrameStats(), slots: new TimeMean(), sharp: new TimeMean(), area: new TimeMean(), maxSync: 0,
+    startEpoch: Date.now(), v0: videoCounters(), starts0: stats.starts, joinTotal0: stats.joinTotal, joins0: stats.joins });
+}
+function perfStop() {
+  win.active = false;
+  const v1 = videoCounters(), f = win.frames.summary(), seconds = (Date.now() - win.startEpoch) / 1000;
+  const meanSlots = win.slots.mean() ?? 0, joins = stats.joins - win.joins0;
+  return {
+    ...win.meta, startEpochMs: win.startEpoch, endEpochMs: Date.now(), seconds,
+    frames: f.frames, fps: f.fps, frameMs: { p50: f.p50, p95: f.p95, p99: f.p99, max: f.max }, hitches: f.hitches,
+    videoFramesDropped: v1.dropped - win.v0.dropped, videoFramesTotal: v1.total - win.v0.total,
+    meanSlots, decodedMpxPerS: decodedMpxPerSecond({ mode: win.meta.mode, slots: meanSlots, grid, base: manifest.base, fps, fullWidth: grid.width, fullHeight: grid.height }),
+    sharpCoverage: win.meta.mode === 'full' ? 1 : win.sharp.mean(),            // time with every on-screen tile decoded
+    sharpArea: win.meta.mode === 'full' ? 1 : win.area.mean(),                // average share of the view drawn from decoded tiles
+    tileStarts: stats.starts - win.starts0, joinMsAvg: joins ? (stats.joinTotal - win.joinTotal0) / joins : null, maxSyncMs: win.maxSync * 1000,
+  };
+}
+
+async function runBench() {
+  const duration = Number(params.get('duration')) || 20, rounds = Number(params.get('rounds')) || 2, settle = 3;
+  if (!sourceOk) { msg(`Benchmark needs the original video at ${sourceUrl}.`); return; }
+  if (document.hidden) msg('Keep this tab in the foreground while the benchmark runs.');
+  const windows = [];
+  const plan = benchOrder(rounds);
+  for (const [i, w] of plan.entries()) {
+    $('benchStatus').textContent = `Benchmark ${i + 1}/${plan.length}: ${w.mode === 'full' ? 'normal playback' : 'tiled'} (round ${w.round}) — don't touch the mouse`;
+    if (!(await setMode(w.mode))) return;
+    tourSpeed = Number(params.get('speed')) || 0.5; tourOn = true; tourT = 0;
+    await sleep(settle * 1000);                 // let decoders start and tiles join before measuring
+    perfStart({ mode: w.mode, round: w.round });
+    await sleep(duration * 1000);
+    windows.push(perfStop());
+  }
+  tourOn = false; tourSpeed = 1;
+  const result = {
+    version: 1, finishedAt: new Date().toISOString(), userAgent: navigator.userAgent,
+    display: { width: innerWidth, height: innerHeight, dpr: devicePixelRatio, hz: windows[0] ? Math.round(windows[0].fps) : null },
+    tileset: { codec: manifest.codec, cols: grid.cols, rows: grid.rows, width: grid.width, height: grid.height, fps, pad: grid.pad, base: manifest.base },
+    settings: { budget: slots.length, marginDeg: Number($('margin').value), fovDeg: Number($('fov').value), durationS: duration, settleS: settle, rounds, tourSpeed: Number(params.get('speed')) || 0.5 },
+    windows,
+  };
+  window.__benchResult = result;
+  $('benchStatus').textContent = 'Benchmark finished.';
+  try { await fetch('/__perf', { method: 'POST', body: JSON.stringify(result) }); $('benchStatus').textContent += ' Results sent to the local analyzer.'; }
+  catch { $('benchStatus').textContent += ' (no analyzer running; use the download link)'; }
+  showBench(result);
+}
+
+function showBench(r) {
+  const by = (m) => r.windows.filter((w) => w.mode === m);
+  const avg = (ws, k) => ws.length ? ws.reduce((a, w) => a + (typeof k === 'function' ? k(w) : w[k]), 0) / ws.length : null;
+  const rows = [
+    ['Frame time p95 (ms)', (ws) => avg(ws, (w) => w.frameMs.p95), 1],
+    ['Frame time p99 (ms)', (ws) => avg(ws, (w) => w.frameMs.p99), 1],
+    ['Hitches > 33 ms', (ws) => avg(ws, 'hitches'), 0],
+    ['Video frames dropped', (ws) => avg(ws, 'videoFramesDropped'), 0],
+    ['Decoded Mpx/s (modeled)', (ws) => avg(ws, 'decodedMpxPerS'), 0],
+    ['View drawn sharp %', (ws) => 100 * avg(ws, 'sharpArea'), 1],
+  ];
+  const f = (v, d) => (v == null ? '–' : v.toFixed(d));
+  $('benchOut').innerHTML = '<table><tr><th></th><th>Normal</th><th>Tiled</th></tr>' +
+    rows.map(([name, fn, d]) => `<tr><td>${name}</td><td>${f(fn(by('full')), d)}</td><td>${f(fn(by('tiled')), d)}</td></tr>`).join('') + '</table>' +
+    `<a id="dl" download="tiling-bench.json" href="data:application/json,${encodeURIComponent(JSON.stringify(r, null, 1))}">download JSON</a>`;
+}
+
+// ---------------------------------------------------------------- mode UI
+$('modeTiled').onchange = () => setMode('tiled');
+$('modeFull').onchange = () => setMode('full');
+$('modeFull').disabled = !sourceOk;
+$('bench').onclick = () => runBench();
+window.__demo.setMode = setMode;
+window.__demo.runBench = runBench;
+if (params.get('mode') === 'full') setMode('full');
+if (params.get('bench')) setTimeout(runBench, 1500);

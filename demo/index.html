@@ -20,6 +20,7 @@
   button { background:var(--accent); color:#06121f; border:0; border-radius:6px; padding:6px 10px; font:inherit; font-weight:600; cursor:pointer; margin:4px 4px 0 0; }
   button.secondary { background:var(--line); color:var(--text); }
   #map { width:100%; height:auto; display:block; border:1px solid var(--line); border-radius:6px; margin:8px 0 4px; background:#0b0e13; }
+  #benchOut table { width:100%; border-collapse:collapse; margin-top:6px; } #benchOut td, #benchOut th { padding:2px 4px; text-align:right; border-bottom:1px solid var(--line); } #benchOut td:first-child, #benchOut th:first-child { text-align:left; } #benchOut a { color:var(--accent); font-size:11px; }
   .legend { display:flex; flex-wrap:wrap; gap:4px 10px; color:var(--dim); font-size:11px; }
   .legend i { display:inline-block; width:9px; height:9px; margin-right:4px; border-radius:2px; vertical-align:-1px; }
   .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:4px 0 6px; }
@@ -35,6 +36,8 @@
 <div id="hint">drag to look · wheel to zoom · arrow keys</div>
 <div class="panel">
   <h1>Tiled 360 decoder</h1>
+  <div class="check"><input id="modeTiled" type="radio" name="mode" checked><label for="modeTiled">Tiled</label>
+    <input id="modeFull" type="radio" name="mode" style="margin-left:12px"><label for="modeFull">Normal playback</label></div>
   <div class="row"><span>Decoder slots in use</span><b id="sSlots">–</b></div>
   <div class="row"><span>Tiles in view / drawn sharp</span><b id="sTiles">–</b></div>
   <div class="row"><span>Pixels decoded vs full frame</span><b id="sPct">–</b></div>
@@ -57,6 +60,8 @@
   <div class="check"><input id="tiling" type="checkbox" checked><label for="tiling">Tiling on (off = low-res base layer only)</label></div>
   <div class="check"><input id="predict" type="checkbox" checked><label for="predict">Prefetch along head motion</label></div>
   <div class="check"><input id="tint" type="checkbox"><label for="tint">Tint tiles that are decoding</label></div>
+  <button id="bench" class="secondary">Run benchmark</button>
+  <div id="benchStatus" class="legend" style="margin-top:6px"></div><div id="benchOut"></div>
   <button id="play">Pause</button><button id="mute" class="secondary">Unmute</button><button id="tour" class="secondary">Auto tour</button>
 </div>
 <script type="module" src="viewer.js"></script>

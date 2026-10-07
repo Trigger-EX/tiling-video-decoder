@@ -5,3 +5,5 @@ __pycache__/
 local.properties
 demo/tileset/
 demo/sample_360.mp4
+demo/source.mp4
+demo/perf/

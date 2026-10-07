@@ -110,5 +110,20 @@ class Vp9TilerTest(TilerTest):
     CODEC = "vp9"
 
 
+class HevcTilerTest(TilerTest):
+    """HEVC is the default codec (smaller files, hardware-decoded on the Oculus Go)."""
+    CODEC = "hevc"
+
+    def test_streams_are_hvc1_main_profile(self):
+        for name in ("base.mp4", self.m["tiles"][0]["file"]):
+            out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                  "stream=codec_name,codec_tag_string,profile,pix_fmt", "-of", "csv=p=0",
+                                  os.path.join(self.out, name)], capture_output=True, text=True, check=True).stdout.strip()
+            self.assertEqual(out, "hevc,Main,hvc1,yuv420p", name)
+
+    def test_default_codec_is_hevc(self):
+        self.assertEqual(self.m["codec"], "hevc")
+
+
 if __name__ == "__main__":
     unittest.main()

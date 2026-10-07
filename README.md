@@ -11,7 +11,7 @@ A single H.264/HEVC stream cannot be decoded in part, so the work is split in th
 |---|---|---|
 | **Tiler** | `tools/tiler.py` (ffmpeg) | Offline: writes `manifest.json`, a low-res whole-sphere `base.mp4` (with the audio), and one video per tile. All streams share one keyframe grid; each tile carries `pad` pixels copied from its neighbours (wrapped at the seam, mirrored at the poles) so filtering never shows seams. |
 | **Core** | `core/` (pure Kotlin) | Manifest parser, sphere/tile geometry, `VisibilityPlanner` (frustum rays → ranked tiles, with margin and predicted poses), `TileScheduler` (decoder budget, linger so border jitter doesn't thrash), `TilePool`, `MediaClock`/`TileDecoder` interfaces, `DecodeCost`. |
-| **Browser demo** | `demo/` | `run_demo.py` + `viewer.js`: the pipeline above running in a browser tab. `demo/tiling.js` is a port of the core geometry/planner/scheduler, tested against the same cases (`node --test tests/tiling.test.mjs`). |
+| **Browser demo + analytics** | `demo/`, `tools/perf_monitor.py` | `run_demo.py` + `viewer.js`: the pipeline above running in a browser tab, plus the tiled-vs-normal benchmark. `demo/tiling.js` is a port of the core geometry/planner/scheduler, tested against the same cases (`node --test tests/tiling.test.mjs`). |
 | **Android decoder** | `decoder-android/` | `MediaCodecTileDecoder`: one reusable decoder slot per `Surface`, follows a `MediaClock`, seeks to the preceding keyframe and decodes forward without showing frames until it catches up. `DecoderProbe`: how many hardware decoders the device really runs at once. |
 
 ```
@@ -38,7 +38,7 @@ decoding, and **Tiling on** to compare against the base layer alone. `--codec vp
 lacks H.264. The "pixels decoded" figure is computed from the active tiles, not measured from the browser, and
 the demo has not been run on a real GPU yet (only in a headless software-GL browser).
 
-## Choosing a codec (default: H.264)
+## Choosing a codec (default: HEVC)
 
 `tools/bench_codecs.py` encodes one tile-sized clip with every codec and tier and reports encode CPU, software
 decode CPU, PSNR/SSIM at equal bitrate, and whether keyframes land exactly on the GOP grid. Numbers from a 4-core
@@ -46,20 +46,19 @@ machine (ffmpeg 6.1, one thread per encode, 512x512 tile, CPU-seconds per second
 
 | codec | encode CPU-s | decode CPU-s (software) | quality at ~400 kbit/s (SSIM) | hardware decode where we need it |
 |---|---|---|---|---|
-| **H.264** (x264) | **0.45 / 0.61** | **0.03** | 0.893 / 0.903 | Go: yes (measured). Every laptop GPU, every browser. |
-| HEVC (x265) | 0.85 / 0.90 | 0.05 | 0.898 / 0.901 | Go: yes (measured). Chrome/Edge/Safari with a GPU; not Firefox on Linux. |
+| H.264 (x264) | 0.45 / 0.61 | 0.03 | 0.893 / 0.903 | Go: yes (measured). Every laptop GPU, every browser. |
+| **HEVC** (x265) | 0.85 / 0.90 | 0.05 | 0.898 / 0.901 | Go: yes (measured). Chrome/Edge/Safari with a GPU; not Firefox on Linux. |
 | VP9 (libvpx) | 0.56 / 1.73 | 0.03 | 0.896 / 0.910 | Go: **not measured, assume no**. Newer GPUs only. |
 | AV1 (SVT-AV1) | 1.15 / 2.05 | 0.05 | 0.917 / 0.918 | Go: **no**. Only recent GPUs (2020+). |
 
 All four hit the keyframe grid exactly, so any of them tiles correctly. The hardware-decode column comes from the
 player repo's measurements (Go) and general browser/GPU support, not from tests here.
 
-**H.264 is the default**, because the decision is made by hardware decoding and encode cost, not by compression:
-the Go's hardware decoders (per `docs/EXECUTION_PLAN.md` in the player repo) are AVC and HEVC only, so VP9/AV1 can't
-play there; H.264 is the only codec every browser decodes in hardware on every laptop; it encodes 1.5-4x cheaper
-than the others; and it is the cheapest to decode. HEVC is the one to switch to (`--codec hevc`) if tile storage or
-Wi-Fi transfer to the headsets becomes the bottleneck, since it is also hardware-decoded on the Go. VP9 stays
-as a fallback for browsers without H.264; AV1 is not recommended.
+**HEVC is the default for `tools/tiler.py`**: the Go's hardware decoders are AVC and HEVC only (per `docs/EXECUTION_PLAN.md`
+in the player repo), and HEVC is the one that helps with the headsets' storage and transfer limits. H.264 stays
+available (`--codec h264`) and is what the browser demo picks by default (`--codec auto`), because Firefox on Linux and
+some other browsers cannot decode HEVC; the viewer says so instead of failing silently. In Chrome, Edge or Safari run the
+demo with `--codec hevc` to test the headset build. VP9 is a fallback for browsers without H.264; AV1 is not recommended.
 
 **Caveat on the quality column:** the only footage available when this was measured was a synthetic clip, which is too
 noisy to separate the codecs by much (all within about 0.025 SSIM; AV1 is slightly ahead at low bitrate). The usual
@@ -92,6 +91,41 @@ With three other busy processes already holding 3 of the 4 cores it ran one job 
 Options: `--headroom 0.5` keeps half the CPU free, `--reserve-mem-mb`, `--max-jobs`, `--tiles-per-job`, and
 `--no-throttle` for the old all-out behaviour. `pip install psutil` is optional (sampling works without it on Linux;
 the Windows and macOS sampling paths are written but untested).
+
+## Performance analytics: tiled vs normal playback
+
+```
+python3 demo/run_demo.py --analyze                      # sample world, then benchmark and report
+python3 demo/run_demo.py --analyze --input my360.mp4    # your own video
+python3 demo/run_demo.py --analyze --no-tile            # re-run on the existing tileset
+python3 demo/run_demo.py --analyze --codec hevc --duration 30 --rounds 3
+```
+
+Opens the viewer in benchmark mode and runs it through a scripted head path (the same path every time, default
+half speed) in **normal playback** (the original video, one decoder, same sphere and renderer) and **tiled**
+playback, alternating the order each round so thermal drift cancels. While it runs, `tools/perf_monitor.py` samples
+the machine twice a second, and the two are lined up by wall-clock time into `demo/perf/report-*.md` (plus the raw
+`bench-*.json` / `samples-*.json`). The viewer also has a **Normal playback** radio button and a **Run benchmark**
+button if you want to compare by eye or run it by hand (`?bench=1&duration=20&rounds=2&speed=0.5`).
+
+| Reported | Source |
+|---|---|
+| Browser CPU (cores busy), browser memory | OS (Linux `/proc`, or `psutil` if installed) |
+| System CPU | OS |
+| Battery power in watts | Linux battery sensor, **only while unplugged** |
+| GPU busy / video-decoder busy | `nvidia-smi` or AMD sysfs if present; **Intel is not read** |
+| Frame time p50/p95/p99, hitches, fps, dropped video frames | the page |
+| Decoded Mpx/s, decoder instances | modeled from the active tiles |
+| View drawn at full resolution, tile join time, tile starts, sync error | the page |
+| Tileset size vs original video | disk |
+
+The report keeps both sides of the trade: tiling should lower decoded pixels and (hopefully) CPU/power, but costs
+more decoder instances, more disk, and some time with low-resolution base layer showing. Read "View drawn at full
+resolution" next to the CPU numbers: a CPU saving that costs visible blur is not a clean win. On a laptop whose GPU
+decodes 4K easily, expect a small difference; the strong case is a source the hardware can't decode whole.
+
+Only the page-side numbers and the system CPU path have been exercised, in a software-rendered headless
+Chromium, whose absolute numbers mean nothing. Power, GPU and the battery path are untested.
 
 ## How it runs on the headset
 

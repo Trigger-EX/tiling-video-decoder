@@ -201,7 +201,8 @@ def main(argv=None):
     p.add_argument("--cols", type=int, default=8)
     p.add_argument("--rows", type=int, default=4)
     p.add_argument("--pad", type=int, default=16, help="border pixels copied from neighbours (default 16)")
-    p.add_argument("--codec", choices=CODECS, default="h264")
+    p.add_argument("--codec", choices=CODECS, default="hevc",
+                   help="default hevc: smaller files and hardware-decoded on the Oculus Go; browsers may need h264")
     p.add_argument("--preset", default="balanced", choices=PRESETS, help="encoder speed/quality tier")
     p.add_argument("--encoder-threads", type=int, default=0, help="threads per encoder (0 = encoder default)")
     p.add_argument("--gop-seconds", type=float, default=1.0, help="keyframe interval; bounds tile start-up latency")

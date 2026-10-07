@@ -56,3 +56,17 @@ test('scheduler respects the budget, lingers, and evicts lower-ranked tiles firs
   const d = s.update(10, [t(2), t(1), t(0)], new Set(['0_0', '0_1']));
   assert.deepEqual([d.stop, d.start], [['0_0'], ['0_2']]);
 });
+
+import { readyCoverage } from '../demo/tiling.js';
+
+test('ready coverage is the share of the view covered by decoded tiles', () => {
+  const all = new Set(grid.all().map(tileKey));
+  assert.equal(readyCoverage(grid, level[0], fov, fov, all), 1);
+  assert.equal(readyCoverage(grid, level[0], fov, fov, new Set()), 0);
+  const needed = planVisible(grid, level, fov, fov);
+  const half = new Set(needed.slice(0, 6).map(tileKey));
+  const c = readyCoverage(grid, level[0], fov, fov, half);
+  assert.ok(c > 0.8 && c < 0.95, `got ${c}`);      // 2 rows x 3 columns hold most of a 100-degree view; the outer rows are only slivers
+  const one = readyCoverage(grid, level[0], fov, fov, new Set([tileKey(needed[0])]));
+  assert.ok(one > 0.05 && one < 0.3, `one tile covered ${one}`);
+});
