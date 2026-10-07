@@ -17,6 +17,7 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 sys.path.insert(0, HERE)
+import resources  # noqa: E402
 import serve  # noqa: E402
 import tiler  # noqa: E402
 
@@ -36,11 +37,12 @@ def make_sample(path, width, height, seconds):
            "-f", "lavfi", "-i", "sine=frequency=330:duration=%d" % seconds]
     enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-g", "30",
            "-c:a", "aac", "-shortest", path]
+    threads = ["-threads", str(max(1, (os.cpu_count() or 2) // 2))]   # half the cores, at low priority
     for vf in (grid + "," + labels, grid):
-        r = subprocess.run(["ffmpeg", "-y", "-v", "error"] + src + ["-vf", vf] + enc, capture_output=True, text=True)
-        if r.returncode == 0:
+        rc, err = resources.run_low_priority(["ffmpeg", "-y", "-v", "error"] + threads + src + ["-vf", vf] + enc)
+        if rc == 0:
             return
-    raise RuntimeError("could not generate the sample video: " + r.stderr[-500:])
+    raise RuntimeError("could not generate the sample video: " + err[-500:])
 
 
 def main():
@@ -48,7 +50,10 @@ def main():
     p.add_argument("--input", help="equirectangular 360 video (default: generate a test video)")
     p.add_argument("--cols", type=int, default=8)
     p.add_argument("--rows", type=int, default=4)
-    p.add_argument("--codec", choices=["h264", "hevc", "vp9"], default="h264")
+    p.add_argument("--codec", choices=tiler.CODECS, default="h264")
+    p.add_argument("--preset", choices=tiler.PRESETS, default="fast", help="encode speed/quality tier (default: fast)")
+    p.add_argument("--headroom", type=float, default=0.30, help="fraction of CPU kept free for other programs (default 0.30)")
+    p.add_argument("--no-throttle", action="store_true", help="use every core at full speed (can make the desktop stutter)")
     p.add_argument("--seconds", type=int, default=20, help="length of the generated sample")
     p.add_argument("--size", default="3840x1920", help="size of the generated sample")
     p.add_argument("--port", type=int, default=8000)
@@ -65,7 +70,8 @@ def main():
             make_sample(src, w, h, a.seconds)
         print("tiling into %dx%d tiles (this encodes %d small videos)..." % (a.cols, a.rows, a.cols * a.rows + 1))
         rc = tiler.main([src, out, "--cols", str(a.cols), "--rows", str(a.rows), "--codec", a.codec,
-                         "--preset", "veryfast", "--bitrate-k", "16000", "--base-bitrate-k", "1500"])
+                         "--preset", a.preset, "--bitrate-k", "16000", "--base-bitrate-k", "1500"] +
+                        (["--no-throttle"] if a.no_throttle else ["--headroom", str(a.headroom)]))
         if rc:
             return rc
     elif not os.path.exists(os.path.join(out, "manifest.json")):

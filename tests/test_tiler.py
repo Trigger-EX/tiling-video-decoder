@@ -39,7 +39,7 @@ class TilerTest(unittest.TestCase):
                "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", cls.src)
         cls.out = os.path.join(cls.tmp.name, "ts")
-        rc = tiler.main([cls.src, cls.out, "--cols", "4", "--rows", "2", "--pad", "16", "--codec", cls.CODEC, "--preset", "ultrafast",
+        rc = tiler.main([cls.src, cls.out, "--cols", "4", "--rows", "2", "--pad", "16", "--codec", cls.CODEC, "--preset", "fast",
                          "--base-width", "320", "--bitrate-k", "4000", "--base-bitrate-k", "300"])
         assert rc == 0
         with open(os.path.join(cls.out, "manifest.json")) as f:
@@ -91,6 +91,18 @@ class TilerTest(unittest.TestCase):
 
         self.assertLess(mad(16, 16, 0, 0, 320, 300), 6)            # interior = source top-left
         self.assertLess(mad(0, 16, sw - 16, 0, 16, 300), 8)        # left pad = wrapped right edge
+
+    def test_tile_from_the_middle_of_a_batched_row_is_cropped_from_the_right_place(self):
+        # Tiles of a row are cut by one ffmpeg process; check row 1, col 2 (not the first of its batch).
+        def gray(path):
+            return subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-frames:v", "1", "-f", "rawvideo",
+                                   "-pix_fmt", "gray", "-"], capture_output=True, check=True).stdout
+        t, s = gray(os.path.join(self.out, "tiles/t_1_2.mp4")), gray(self.src)
+        tot = n = 0
+        for y in range(0, 300, 3):
+            for x in range(0, 300, 3):
+                tot += abs(t[(16 + y) * 352 + 16 + x] - s[(320 + y) * 1280 + 640 + x]); n += 1
+        self.assertLess(tot / n, 6)
 
 
 class Vp9TilerTest(TilerTest):

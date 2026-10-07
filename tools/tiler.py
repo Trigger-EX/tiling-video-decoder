@@ -19,7 +19,9 @@ import json
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import resources  # noqa: E402
 
 FORMAT_VERSION = 1
 
@@ -69,19 +71,56 @@ def padded_source_filter(width, height, pad):
     )
 
 
-def x264_args(codec, gop, bitrate_k, fps, preset="medium"):
-    common = ["-pix_fmt", "yuv420p", "-b:v", "%dk" % bitrate_k,
-              "-maxrate", "%dk" % int(bitrate_k * 1.5), "-bufsize", "%dk" % (bitrate_k * 2)]
-    if codec == "vp9":  # for browsers/desktops without H.264; keyframes forced onto the same grid
-        return ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "6", "-row-mt", "1",
-                "-lag-in-frames", "0", "-auto-alt-ref", "0", "-g", str(gop), "-keyint_min", str(gop),
-                "-force_key_frames", "expr:gte(t,n_forced*%s)" % (gop / fps)] + common
+PRESETS = ("fast", "balanced", "quality")
+CODECS = ("h264", "hevc", "vp9", "av1")
+_X26X = {"fast": "veryfast", "balanced": "medium", "quality": "slow"}
+_VP9 = {"fast": ["-deadline", "realtime", "-cpu-used", "6"], "balanced": ["-deadline", "good", "-cpu-used", "3"],
+        "quality": ["-deadline", "good", "-cpu-used", "1"]}
+_AV1 = {"fast": "10", "balanced": "8", "quality": "5"}
+
+
+def encoder_args(codec, gop, bitrate_k, fps, preset="balanced", threads=0):
+    """ffmpeg video-encoder arguments. All codecs get the same closed-GOP keyframe grid (no scene-cut
+    keyframes, no B-frame reordering), so tiles can start at any keyframe and stay in step.
+    `threads` caps the encoder's worker threads (0 = encoder default, i.e. every core)."""
+    if preset not in PRESETS:
+        raise ValueError("preset must be one of %s" % ", ".join(PRESETS))
+    t = ["-threads", str(threads)] if threads else []
+    rate = ["-pix_fmt", "yuv420p", "-b:v", "%dk" % bitrate_k,
+            "-maxrate", "%dk" % int(bitrate_k * 1.5), "-bufsize", "%dk" % (bitrate_k * 2)]
     if codec == "h264":
-        return ["-c:v", "libx264", "-profile:v", "high", "-preset", preset, "-bf", "0",
-                "-x264-params", "keyint=%d:min-keyint=%d:scenecut=0:open-gop=0" % (gop, gop)] + common
-    return ["-c:v", "libx265", "-preset", preset, "-tag:v", "hvc1",
-            "-x265-params", "keyint=%d:min-keyint=%d:scenecut=0:open-gop=0:bframes=0:log-level=error"
-            % (gop, gop)] + common
+        return ["-c:v", "libx264", "-profile:v", "high", "-preset", _X26X[preset], "-bf", "0"] + t + \
+               ["-x264-params", "keyint=%d:min-keyint=%d:scenecut=0:open-gop=0" % (gop, gop)] + rate
+    if codec == "hevc":
+        pools = ":pools=%d" % threads if threads else ""
+        return ["-c:v", "libx265", "-preset", _X26X[preset], "-tag:v", "hvc1"] + t + \
+               ["-x265-params", "keyint=%d:min-keyint=%d:scenecut=0:open-gop=0:bframes=0:log-level=error%s"
+                % (gop, gop, pools)] + rate
+    if codec == "vp9":
+        return ["-c:v", "libvpx-vp9"] + _VP9[preset] + ["-row-mt", "1", "-lag-in-frames", "0", "-auto-alt-ref", "0",
+                "-g", str(gop), "-keyint_min", str(gop), "-force_key_frames", "expr:gte(t,n_forced*%s)" % (gop / fps)] + t + rate
+    if codec == "av1":
+        return ["-c:v", "libsvtav1", "-preset", _AV1[preset], "-g", str(gop)] + t + \
+               ["-svtav1-params", "keyint=%d:scd=0:irefresh-type=2" % gop] + rate
+    raise ValueError("unknown codec %s" % codec)
+
+
+def ffmpeg_major():
+    try:
+        out = run(["ffmpeg", "-version"]).split()[2]
+        return int(out.lstrip("nN").split(".")[0])
+    except (RuntimeError, IndexError, ValueError, OSError):
+        return 6
+
+
+class _Unlimited:
+    """Stand-in governor for --no-throttle: start everything immediately."""
+    busy = mem_mb = None
+
+    def __init__(self, n): self.n = n
+    def sample(self): pass
+    def may_start(self, running): return True, ""
+    def started(self): pass
 
 
 def build(args):
@@ -93,27 +132,50 @@ def build(args):
     os.makedirs(os.path.join(args.output, "tiles"), exist_ok=True)
 
     tile_bitrate = args.tile_bitrate_k or max(200, int(args.bitrate_k * (cw * ch) / (width * height) * 1.0))
+    gov = resources.Governor(headroom=args.headroom, reserve_mem_mb=args.reserve_mem_mb, max_jobs=args.max_jobs) \
+        if args.headroom is not None else None
+    cores = gov.cores if gov else (os.cpu_count() or 1)
+    threads = args.encoder_threads or max(1, cores // 4)
+    per_job = max(1, min(args.tiles_per_job or args.cols, args.cols))
+
+    # One ffmpeg process decodes the source once and writes `per_job` tiles of a row. Decoding the whole
+    # frame is most of the cost of a tile, so doing it once per row (not once per tile) uses ~4x less CPU.
     jobs = []
     for r in range(args.rows):
-        for c in range(args.cols):
-            name = "tiles/t_%d_%d.mp4" % (r, c)
-            graph = "%s;[p]crop=%d:%d:%d:%d[t]" % (padded_source_filter(width, height, args.pad),
-                                                   cw, ch, c * tw, r * th)
-            cmd = ["ffmpeg", "-y", "-v", "error", "-i", args.input, "-filter_complex", graph,
-                   "-map", "[t]", "-an"] + x264_args(args.codec, gop, tile_bitrate, fps, args.preset) + \
-                  ["-movflags", "+faststart", os.path.join(args.output, name)]
-            jobs.append((name, cmd))
+        for i in range(0, args.cols, per_job):
+            jobs.append([(r, c) for c in range(i, min(i + per_job, args.cols))])
 
-    base_cmd = ["ffmpeg", "-y", "-v", "error", "-i", args.input, "-map", "0:v:0"]
+    cmds = []
+    for chunk in jobs:
+        n = len(chunk)
+        graph = padded_source_filter(width, height, args.pad)
+        if n == 1:
+            graph += ";[p]crop=%d:%d:%d:%d[t0]" % (cw, ch, chunk[0][1] * tw, chunk[0][0] * th)
+        else:
+            graph += ";[p]split=%d%s;" % (n, "".join("[q%d]" % k for k in range(n)))
+            graph += ";".join("[q%d]crop=%d:%d:%d:%d[t%d]" % (k, cw, ch, c * tw, r * th, k) for k, (r, c) in enumerate(chunk))
+        cmd = ["ffmpeg", "-y", "-v", "error", "-threads", str(threads), "-filter_complex_threads", "1",
+               "-i", args.input, "-filter_complex", graph]
+        for k, (r, c) in enumerate(chunk):
+            cmd += ["-map", "[t%d]" % k, "-an"] + encoder_args(args.codec, gop, tile_bitrate, fps, args.preset, threads) + \
+                   ["-movflags", "+faststart", os.path.join(args.output, "tiles/t_%d_%d.mp4" % (r, c))]
+        cmds.append(("row %d tiles %d-%d" % (chunk[0][0], chunk[0][1], chunk[-1][1]), cmd))
+
+    base_cmd = ["ffmpeg", "-y", "-v", "error", "-threads", str(threads), "-i", args.input, "-map", "0:v:0"]
     if has_audio(args.input):
         base_cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "128k"]
-    base_cmd += ["-vf", "scale=%d:%d" % (base_w, base_h)] + x264_args(args.codec, gop, args.base_bitrate_k, fps, args.preset) + \
-                ["-movflags", "+faststart", os.path.join(args.output, "base.mp4")]
-    jobs.append(("base.mp4", base_cmd))
+    base_cmd += ["-vf", "scale=%d:%d" % (base_w, base_h)] + \
+        encoder_args(args.codec, gop, args.base_bitrate_k, fps, args.preset, threads) + \
+        ["-movflags", "+faststart", os.path.join(args.output, "base.mp4")]
+    cmds.append(("base layer", base_cmd))
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        for f in [ex.submit(run, cmd) for _, cmd in jobs]:
-            f.result()
+    if gov:
+        # A job's encoders may each get a thread in newer ffmpeg; plan for the worst case there.
+        gov.job_cores = float(threads) if ffmpeg_major() < 7 else float(min(per_job * threads, cores))
+        gov.job_mem_mb = width * height * 1.5 * 28 / 2**20 + 100           # ~28 source frames in flight
+        resources.run_jobs(cmds, gov, log=print if not args.quiet else (lambda *_: None))
+    else:                                                                    # --no-throttle: all at once, as before
+        resources.run_jobs(cmds, _Unlimited(len(cmds)), log=print if not args.quiet else (lambda *_: None))
 
     manifest = {
         "version": FORMAT_VERSION,
@@ -139,14 +201,23 @@ def main(argv=None):
     p.add_argument("--cols", type=int, default=8)
     p.add_argument("--rows", type=int, default=4)
     p.add_argument("--pad", type=int, default=16, help="border pixels copied from neighbours (default 16)")
-    p.add_argument("--codec", choices=["h264", "hevc", "vp9"], default="h264")
-    p.add_argument("--preset", default="medium", help="x264/x265 preset (use veryfast for quick demos)")
+    p.add_argument("--codec", choices=CODECS, default="h264")
+    p.add_argument("--preset", default="balanced", choices=PRESETS, help="encoder speed/quality tier")
+    p.add_argument("--encoder-threads", type=int, default=0, help="threads per encoder (0 = encoder default)")
     p.add_argument("--gop-seconds", type=float, default=1.0, help="keyframe interval; bounds tile start-up latency")
     p.add_argument("--base-width", type=int, default=1280, help="whole-sphere fallback layer width (2:1)")
     p.add_argument("--bitrate-k", type=int, default=30000, help="budget for the full frame; tiles get their share")
     p.add_argument("--tile-bitrate-k", type=int, default=0, help="override per-tile bitrate")
     p.add_argument("--base-bitrate-k", type=int, default=2500)
-    p.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
+    g = p.add_argument_group("CPU/memory limits (default: stay out of the way of the rest of the system)")
+    g.add_argument("--headroom", type=float, default=0.30,
+                   help="fraction of total CPU to keep idle for other programs (default 0.30)")
+    g.add_argument("--reserve-mem-mb", type=int, default=2048, help="memory to keep available (default 2048)")
+    g.add_argument("--max-jobs", type=int, default=None, help="cap on simultaneous ffmpeg processes")
+    g.add_argument("--tiles-per-job", type=int, default=None, help="tiles per ffmpeg process (default: one whole row)")
+    g.add_argument("--no-throttle", dest="headroom", action="store_const", const=None,
+                   help="start every job at once at normal priority (fastest, can freeze the desktop)")
+    p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
     try:
         m = build(args)

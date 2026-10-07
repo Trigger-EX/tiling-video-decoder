@@ -38,6 +38,61 @@ decoding, and **Tiling on** to compare against the base layer alone. `--codec vp
 lacks H.264. The "pixels decoded" figure is computed from the active tiles, not measured from the browser, and
 the demo has not been run on a real GPU yet (only in a headless software-GL browser).
 
+## Choosing a codec (default: H.264)
+
+`tools/bench_codecs.py` encodes one tile-sized clip with every codec and tier and reports encode CPU, software
+decode CPU, PSNR/SSIM at equal bitrate, and whether keyframes land exactly on the GOP grid. Numbers from a 4-core
+machine (ffmpeg 6.1, one thread per encode, 512x512 tile, CPU-seconds per second of video, tiers `fast` / `balanced`):
+
+| codec | encode CPU-s | decode CPU-s (software) | quality at ~400 kbit/s (SSIM) | hardware decode where we need it |
+|---|---|---|---|---|
+| **H.264** (x264) | **0.45 / 0.61** | **0.03** | 0.893 / 0.903 | Go: yes (measured). Every laptop GPU, every browser. |
+| HEVC (x265) | 0.85 / 0.90 | 0.05 | 0.898 / 0.901 | Go: yes (measured). Chrome/Edge/Safari with a GPU; not Firefox on Linux. |
+| VP9 (libvpx) | 0.56 / 1.73 | 0.03 | 0.896 / 0.910 | Go: **not measured, assume no**. Newer GPUs only. |
+| AV1 (SVT-AV1) | 1.15 / 2.05 | 0.05 | 0.917 / 0.918 | Go: **no**. Only recent GPUs (2020+). |
+
+All four hit the keyframe grid exactly, so any of them tiles correctly. The hardware-decode column comes from the
+player repo's measurements (Go) and general browser/GPU support, not from tests here.
+
+**H.264 is the default**, because the decision is made by hardware decoding and encode cost, not by compression:
+the Go's hardware decoders (per `docs/EXECUTION_PLAN.md` in the player repo) are AVC and HEVC only, so VP9/AV1 can't
+play there; H.264 is the only codec every browser decodes in hardware on every laptop; it encodes 1.5-4x cheaper
+than the others; and it is the cheapest to decode. HEVC is the one to switch to (`--codec hevc`) if tile storage or
+Wi-Fi transfer to the headsets becomes the bottleneck, since it is also hardware-decoded on the Go. VP9 stays
+as a fallback for browsers without H.264; AV1 is not recommended.
+
+**Caveat on the quality column:** the only footage available when this was measured was a synthetic clip, which is too
+noisy to separate the codecs by much (all within about 0.025 SSIM; AV1 is slightly ahead at low bitrate). The usual
+real-footage advantage of HEVC (roughly 25-40% fewer bits at equal quality) did *not* show up here and should not be
+assumed from these numbers. Run `python3 tools/bench_codecs.py --input your_360.mp4` to measure on real content.
+
+## Running politely (CPU and memory limits)
+
+Tiling encodes one video per tile, which can take every core. `tools/tiler.py` (and so `demo/run_demo.py`) now
+limits itself by default:
+
+* **One decode per row, not per tile.** A row of tiles is cut by a single ffmpeg process that decodes the source once.
+  Decoding the full frame was most of the cost of each tile: on a 3840x1920 test this alone cut CPU use from
+  142 to 33 CPU-seconds and wall time from 37 s to 21 s.
+* **Adaptive concurrency.** `tools/resources.py` samples *whole-system* CPU and free memory (so other programs count) and
+  starts another ffmpeg only if its estimated load still fits under `1 - headroom` of the CPU and leaves the memory
+  reserve free. The first job always runs, so it always finishes, just slower when the machine is busy.
+* **Low priority.** ffmpeg runs at nice 15 (below-normal on Windows) and low disk priority, so the desktop wins
+  immediately if you start doing something, without waiting for the next scheduling decision.
+* **Capped threads** per ffmpeg (a quarter of the cores) so a single job cannot spread across every core.
+
+Measured on the same 4-core machine, same 3840x1920 8x4 job:
+
+| | wall | CPU used | system CPU mean / peak | wake-up delay p99 |
+|---|---|---|---|---|
+| before | 37 s | 142 CPU-s | 97% / 100% | 4.8 ms |
+| now (headroom 30%) | 21 s | 33 CPU-s | 40% / 53% | 0.5 ms |
+
+With three other busy processes already holding 3 of the 4 cores it ran one job at a time and still finished (33 s).
+Options: `--headroom 0.5` keeps half the CPU free, `--reserve-mem-mb`, `--max-jobs`, `--tiles-per-job`, and
+`--no-throttle` for the old all-out behaviour. `pip install psutil` is optional (sampling works without it on Linux;
+the Windows and macOS sampling paths are written but untested).
+
 ## How it runs on the headset
 
 1. `base.mp4` plays in the existing `ExoVideoPlayer`: it owns the audio and is the master clock (`MediaClock` wraps its position; bump `epoch` on every seek, load and loop).
