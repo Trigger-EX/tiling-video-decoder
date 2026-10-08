@@ -24,7 +24,12 @@ if (!document.createElement('video').canPlayType(MIME[manifest.codec] || '')) {
   throw new Error('codec unsupported');
 }
 const sourceUrl = params.get('source') || 'source.mp4';
-const probeSource = async () => !!(await fetch(sourceUrl, { method: 'HEAD' }).catch(() => null))?.ok;
+// Only a definite "not found" counts. If the check itself fails or times out (e.g. the browser's connections are busy)
+// we don't know, so assume the file is there and let a real load error say otherwise.
+const probeSource = async () => {
+  const r = await fetch(sourceUrl, { method: 'HEAD', signal: AbortSignal.timeout(3000) }).catch(() => null);
+  return r === null ? true : r.ok;
+};
 let sourceOk = await probeSource();
 
 const g = manifest.grid;
@@ -66,7 +71,8 @@ function unload(v) { harvest(v); v.pause(); v.removeAttribute('src'); v.load(); 
 // A slot is one decoder instance: a <video> element that is pointed at different tiles. Releasing
 // a slot (removing its src) frees the browser's hardware decoder, which is the point of tiling.
 let slots = [];
-const budgetCtl = new AdaptiveBudget(12);        // decoders we dare to run; backs off when tiles stall
+const budgetCtl = new AdaptiveBudget(16);        // decoders we dare to run; backs off when tiles stall
+const adaptive = () => $('adaptive').checked;
 const cooldown = new Map();                     // tile key -> time before which it will not be started again
 let joinLead = 0.5;                             // seconds ahead of the clock a joining tile seeks to (learned)
 function makeSlot() {
@@ -213,7 +219,7 @@ $('tour').onclick = () => { tourOn = !tourOn; tourT = 0; };
 let tourT = 0;
 // The same head path every time, so two runs (or two modes) see identical motion.
 const tourPose = (t) => ({ yaw: rad(110) * Math.sin(t * 0.55) + t * 0.35, pitch: rad(40) * Math.sin(t * 0.8) });
-setFov(90); $('vMargin').textContent = $('margin').value; setBudget(12);
+setFov(Number($('fov').value)); $('vMargin').textContent = $('margin').value; setBudget(Number($('budget').value));
 baseVideo.play().catch(() => msg('Click anywhere to start playback.'));
 addEventListener('pointerdown', () => { msg(''); if (playing) clockVideo().play().catch(() => {}); }, { once: true });
 
@@ -236,7 +242,7 @@ function updateSlots(now) {
     areaNow = tilingOn ? readyCoverage(grid, { yaw, pitch }, halfH, halfV, new Set(slots.filter((s) => s.key && s.ready).map((s) => s.key))) : 0;
     const active = new Set(slots.filter((s) => s.key).map((s) => s.key));
     const healthy = !slots.some((s) => s.key && !s.ready && now - s.assignedAt > 2000);
-    scheduler.budget = budgetCtl.tick(now, healthy);
+    scheduler.budget = adaptive() ? budgetCtl.tick(now, healthy) : slots.length;     // fixed budget unless adaptation is switched on
     const eligible = wantedTiles.filter((t) => (cooldown.get(tileKey(t)) ?? 0) <= now);   // not recently given up on
     const d = scheduler.update(now, eligible, active);
     for (const k of d.stop) release(slots.find((s) => s.key === k));
@@ -272,7 +278,7 @@ function updateSlots(now) {
     if (s.ready) maxSync = Math.max(maxSync, Math.abs(wrapDiff(v.currentTime, clock, dur)));
     const q = v.getVideoPlaybackQuality?.(); if (q) s.dropped = q.droppedVideoFrames;
   }
-  if (stalledNow || lateNow) budgetCtl.stalled(now, stalledNow + lateNow);
+  if (adaptive() && (stalledNow || lateNow)) budgetCtl.stalled(now, stalledNow + lateNow);
   stats.maxSync = maxSync;
   if (win.active) { win.maxSync = Math.max(win.maxSync, maxSync); win.effMin = Math.min(win.effMin, budgetCtl.eff); }
 }
@@ -332,7 +338,7 @@ function updatePanel(now) {
   const basePx = manifest.base.width * manifest.base.height;
   const fullPx = grid.width * grid.height * fps, decodedPx = mode === 'full' ? fullPx : (active.length * codedPx + basePx) * fps;
   const pct = (100 * decodedPx) / fullPx;
-  $('sSlots').textContent = `${active.length} / ${slots.length}` + (budgetCtl.eff < slots.length ? ` (limited to ${budgetCtl.eff})` : '');
+  $('sSlots').textContent = `${active.length} / ${slots.length}` + (adaptive() && budgetCtl.eff < slots.length ? ` (limited to ${budgetCtl.eff})` : '');
   $('sTiles').textContent = `${Math.min(wantedTiles.length, 999)} / ${stats.tilesDrawn}`;
   $('sPct').textContent = `${pct.toFixed(0)}%`;
   $('pctBar').style.width = `${Math.min(100, pct)}%`;
@@ -362,6 +368,7 @@ window.__demo = { setTour: (on) => { tourOn = on; tourT = 0; }, setView: (y, p) 
 // ---------------------------------------------------------------- mode switching and benchmark
 const win = { active: false, maxSync: 0 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const withTimeout = (p, ms, fallback) => Promise.race([p, new Promise((r) => setTimeout(() => r(fallback), ms))]);
 
 async function setMode(m) {
   if (m === mode) return true;
@@ -375,11 +382,16 @@ async function setMode(m) {
   unload(other);
   target.muted = muted;
   target.src = m === 'full' ? sourceUrl : base + manifest.base.file;
-  await new Promise((r) => { target.addEventListener('loadedmetadata', r, { once: true }); target.addEventListener('error', r, { once: true }); });
-  if (!sourceOk && m === 'full') { await setMode('tiled'); return false; }
+  const loaded = await withTimeout(new Promise((r) => { target.addEventListener('loadedmetadata', () => r(true), { once: true }); target.addEventListener('error', () => r(false), { once: true }); }), 10000, false);
+  if (!loaded) {                                  // never hang: say what happened and go back
+    msg(`The ${m === 'full' ? 'original' : 'base-layer'} video did not load within 10 s.`);
+    unload(target); mode = m === 'full' ? 'tiled' : mode;
+    if (m === 'full') { sourceOk = false; await setMode('tiled'); }
+    return false;
+  }
   target.currentTime = t % (target.duration || t + 1);
   if (playing) await target.play().catch(() => {});
-  await new Promise((r) => ('requestVideoFrameCallback' in target ? target.requestVideoFrameCallback(() => r()) : setTimeout(r, 400)));
+  await withTimeout(new Promise((r) => ('requestVideoFrameCallback' in target ? target.requestVideoFrameCallback(() => r()) : setTimeout(r, 400))), 3000, null);
   return true;
 }
 
@@ -409,7 +421,14 @@ function perfStop() {
   };
 }
 
+let benchRunning = false;
 async function runBench() {
+  if (benchRunning) return;
+  benchRunning = true;
+  try { await runBenchInner(); } finally { benchRunning = false; tourOn = false; tourSpeed = 1; }
+}
+
+async function runBenchInner() {
   const duration = Number(params.get('duration')) || 20, rounds = Number(params.get('rounds')) || 2, settle = 3;
   if (!sourceOk) await recheckSource();
   if (!sourceOk) { msg(`Benchmark needs the original video at ${sourceUrl}.`); return; }
@@ -418,7 +437,7 @@ async function runBench() {
   const plan = benchOrder(rounds);
   for (const [i, w] of plan.entries()) {
     $('benchStatus').textContent = `Benchmark ${i + 1}/${plan.length}: ${w.mode === 'full' ? 'normal playback' : 'tiled'} (round ${w.round}) — don't touch the mouse`;
-    if (!(await setMode(w.mode))) return;
+    if (!(await setMode(w.mode))) { $('benchStatus').textContent = `Benchmark stopped at ${i + 1}/${plan.length}: a video did not load.`; return; }
     tourSpeed = Number(params.get('speed')) || 0.5; tourOn = true; tourT = 0;
     await sleep(settle * 1000);                 // let decoders start and tiles join before measuring
     perfStart({ mode: w.mode, round: w.round });

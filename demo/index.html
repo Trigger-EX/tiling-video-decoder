@@ -51,13 +51,14 @@
   <div class="legend"><span><i style="background:#3ecf8e"></i>drawn</span><span><i style="background:#f5a524"></i>joining</span><span><i style="background:#5b6472"></i>lingering</span><span><i style="border:1px solid #ef5350"></i>wanted, no slot</span></div>
 
   <label class="ctl">Decoder budget: <b id="vBudget"></b></label>
-  <input id="budget" type="range" min="1" max="24" value="12">
+  <input id="budget" type="range" min="1" max="24" value="16">
   <label class="ctl">Prefetch margin: <b id="vMargin"></b>°</label>
   <input id="margin" type="range" min="0" max="45" value="10">
   <label class="ctl">Field of view (vertical): <b id="vFov"></b>°</label>
-  <input id="fov" type="range" min="40" max="120" value="90">
+  <input id="fov" type="range" min="40" max="120" value="100">
 
   <div class="check"><input id="tiling" type="checkbox" checked><label for="tiling">Tiling on (off = low-res base layer only)</label></div>
+  <div class="check"><input id="adaptive" type="checkbox"><label for="adaptive" title="Lower the decoder count automatically when tiles cannot keep up">Adapt decoder count to load (off = always use the budget)</label></div>
   <div class="check"><input id="predict" type="checkbox" checked><label for="predict">Prefetch along head motion</label></div>
   <div class="check"><input id="tint" type="checkbox"><label for="tint">Tint tiles that are decoding</label></div>
   <button id="bench" class="secondary">Run benchmark</button>

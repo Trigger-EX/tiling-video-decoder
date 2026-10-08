@@ -10,6 +10,15 @@ import time
 import urllib.parse
 
 
+# A browser asks for "bytes=N-" (everything from N). If we really send everything, that response stays open for as
+# long as the <video> exists, because the browser reads only as fast as it plays. Browsers allow about six
+# simultaneous connections per server, so a dozen tile videos would hold all of them and everything else (more
+# tiles, the base layer, the original video) would wait in a queue forever. Answering with at most MAX_CHUNK bytes
+# is allowed (206 + Content-Range says what was sent); the browser simply asks again when it needs more, and no
+# connection is held open while it is not reading. 0 disables the limit.
+MAX_CHUNK = int(os.environ.get("TILING_MAX_CHUNK", 1 << 20))
+
+
 class RangeHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -63,6 +72,8 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
         else:
             start = int(m.group(1))
             end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            if MAX_CHUNK:
+                end = min(end, start + MAX_CHUNK - 1)
         if start >= size or start > end:
             self.send_error(416)
             return None
