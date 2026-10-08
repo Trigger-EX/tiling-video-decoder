@@ -1,5 +1,6 @@
 import { Grid, planVisible, Scheduler, rotation, apply, tileKey, rad, readyCoverage } from './tiling.js';
 import { FrameStats, TimeMean, benchOrder, decodedMpxPerSecond } from './perf.js';
+import { step, newSync, nextLead, wrapDiff, AdaptiveBudget } from './slotsync.js';
 
 const params = new URLSearchParams(location.search);
 const base = (params.get('tileset') || 'tileset').replace(/\/$/, '') + '/';
@@ -23,7 +24,8 @@ if (!document.createElement('video').canPlayType(MIME[manifest.codec] || '')) {
   throw new Error('codec unsupported');
 }
 const sourceUrl = params.get('source') || 'source.mp4';
-let sourceOk = !!(await fetch(sourceUrl, { method: 'HEAD' }).catch(() => null))?.ok;
+const probeSource = async () => !!(await fetch(sourceUrl, { method: 'HEAD' }).catch(() => null))?.ok;
+let sourceOk = await probeSource();
 
 const g = manifest.grid;
 const grid = new Grid(g.cols, g.rows, g.tileWidth, g.tileHeight, g.pad);
@@ -42,7 +44,8 @@ const baseVideo = makeVideo();
 baseVideo.src = base + manifest.base.file;
 // "Normal playback": the original video, one decoder, drawn on the same sphere. Used for comparisons.
 const sourceVideo = makeVideo();
-sourceVideo.addEventListener('error', () => { sourceOk = false; $('modeFull').disabled = true; });
+// Only a failure while a source is actually loaded counts; some browsers also raise 'error' when we unload one.
+sourceVideo.addEventListener('error', () => { if (sourceVideo.getAttribute('src')) { sourceOk = false; $('modeFull').disabled = true; } });
 let mode = 'tiled';
 let muted = true;
 const clockVideo = () => (mode === 'full' ? sourceVideo : baseVideo);
@@ -63,31 +66,43 @@ function unload(v) { harvest(v); v.pause(); v.removeAttribute('src'); v.load(); 
 // A slot is one decoder instance: a <video> element that is pointed at different tiles. Releasing
 // a slot (removing its src) frees the browser's hardware decoder, which is the point of tiling.
 let slots = [];
+const budgetCtl = new AdaptiveBudget(12);        // decoders we dare to run; backs off when tiles stall
+const cooldown = new Map();                     // tile key -> time before which it will not be started again
+let joinLead = 0.5;                             // seconds ahead of the clock a joining tile seeks to (learned)
 function makeSlot() {
-  const s = { video: makeVideo(), tile: null, key: null, assignedAt: 0, readyAt: 0, ready: false, dirty: false, frames: 0, texture: createTexture(), dropped: 0 };
+  const s = { video: makeVideo(), tile: null, key: null, assignedAt: 0, readyAt: 0, ready: false, dirty: false, frames: 0, texture: createTexture(), dropped: 0, sync: null, releasing: false, lastJoin: 0 };
   if ('requestVideoFrameCallback' in s.video) {
     const onFrame = () => { s.dirty = true; s.frames++; s.video.requestVideoFrameCallback(onFrame); };
     s.video.requestVideoFrameCallback(onFrame);
   }
+  s.video.addEventListener('seeked', () => { s.dirty = true; });     // a paused video shows a new frame after a seek
   return s;
 }
 function setBudget(n) {
   while (slots.length < n) slots.push(makeSlot());
   while (slots.length > n) { const s = slots.pop(); release(s); gl.deleteTexture(s.texture); }
   scheduler = new Scheduler(n, 1500);
+  budgetCtl.setMax(n);
   $('vBudget').textContent = n;
 }
-function assign(s, key) {
+function assign(s, key, now) {
   const [row, col] = key.split('_').map(Number);
-  s.tile = { row, col }; s.key = key; s.ready = false; s.frames = 0; s.dirty = false; s.assignedAt = performance.now();
-  s.video.src = base + fileOf[key];
-  s.video.addEventListener('loadedmetadata', () => { s.video.currentTime = baseVideo.currentTime; }, { once: true });
-  if (playing) s.video.play().catch(() => {});
+  const dur = baseVideo.duration || manifest.durationSeconds;
+  s.tile = { row, col }; s.key = key; s.ready = false; s.frames = 0; s.dirty = true; s.assignedAt = now;
+  s.sync = newSync(now, baseVideo.currentTime, dur, joinLead);
+  s.video.playbackRate = 1;
+  s.video.src = base + fileOf[key] + '#t=' + s.sync.target.toFixed(3);   // start straight at the target; no separate seek after loading
   stats.starts++;
 }
 function release(s) {
   unload(s.video);
-  s.tile = null; s.key = null; s.ready = false;
+  s.tile = null; s.key = null; s.ready = false; s.sync = null;
+  // Tearing a decoder down takes a moment; don't start another in this slot until it has finished (or 100 ms),
+  // so a burst of tile changes cannot pile up decoders that are still shutting down.
+  s.releasing = true;
+  const done = () => { s.releasing = false; };
+  s.video.addEventListener('emptied', done, { once: true });
+  setTimeout(done, 100);
 }
 
 // ---------------------------------------------------------------- WebGL
@@ -169,7 +184,7 @@ function mvp(yaw, pitch, fovV, aspect) {
 // ---------------------------------------------------------------- state & input
 let yaw = 0, pitch = 0, fovV = rad(90), playing = true, tourOn = false, scheduler;
 let vel = { yaw: 0, pitch: 0 }; // rad/s, smoothed
-const stats = { starts: 0, joinTotal: 0, joins: 0, tilesWanted: 0, tilesDrawn: 0, maxSync: 0 };
+const stats = { starts: 0, joinTotal: 0, joins: 0, tilesWanted: 0, tilesDrawn: 0, maxSync: 0, stalls: 0, rejoins: 0 };
 let wantedTiles = [];
 const clampPitch = (p) => Math.max(rad(-89), Math.min(rad(89), p));
 
@@ -220,30 +235,46 @@ function updateSlots(now) {
     needNow = planVisible(grid, [{ yaw, pitch }], halfH, halfV, 0).map(tileKey);   // tiles actually on screen
     areaNow = tilingOn ? readyCoverage(grid, { yaw, pitch }, halfH, halfV, new Set(slots.filter((s) => s.key && s.ready).map((s) => s.key))) : 0;
     const active = new Set(slots.filter((s) => s.key).map((s) => s.key));
-    const d = scheduler.update(now, wantedTiles, active);
+    const healthy = !slots.some((s) => s.key && !s.ready && now - s.assignedAt > 2000);
+    scheduler.budget = budgetCtl.tick(now, healthy);
+    const eligible = wantedTiles.filter((t) => (cooldown.get(tileKey(t)) ?? 0) <= now);   // not recently given up on
+    const d = scheduler.update(now, eligible, active);
     for (const k of d.stop) release(slots.find((s) => s.key === k));
-    for (const k of d.start) assign(slots.find((s) => !s.key), k);
+    // Start a few tiles at a time, most important first; the rest are picked up on the next tick. Starting
+    // every decoder at once is what overloads a machine that is already struggling.
+    let joining = slots.filter((s) => s.key && !s.ready).length;
+    for (const k of d.start) {
+      if (joining >= budgetCtl.maxJoining(now)) break;
+      const free = slots.find((s) => !s.key && !s.releasing);
+      if (!free) break;
+      assign(free, k, now); joining++;
+    }
   }
   { const ready = new Set(slots.filter((s) => s.key && s.ready).map((s) => s.key)); sharpNow = tilingOn && needNow.every((k) => ready.has(k)); }
   const clock = baseVideo.currentTime, dur = baseVideo.duration || manifest.durationSeconds;
-  let maxSync = 0;
+  let maxSync = 0, stalledNow = 0, lateNow = 0;
   for (const s of slots) {
-    if (!s.key) continue;
+    if (!s.key || !s.sync) continue;
     const v = s.video;
-    let diff = v.currentTime - clock;
-    if (diff > dur / 2) diff -= dur; else if (diff < -dur / 2) diff += dur;   // loop wrap
-    const ok = v.readyState >= 2 && !v.seeking && s.frames > 0 && Math.abs(diff) < 0.2;
-    if (ok && !s.ready) { s.ready = true; s.readyAt = now; stats.joinTotal += now - s.assignedAt; stats.joins++; }
-    if (!ok && s.ready && Math.abs(diff) >= 0.2) s.ready = false;
-    if (v.readyState >= 1 && playing) {
-      if (Math.abs(diff) > 0.3) { v.currentTime = clock; }                                  // re-seek: decoder restarts at the keyframe before
-      else v.playbackRate = Math.max(0.9, Math.min(1.1, 1 - diff * 0.5));                   // gentle nudge
-    } else if (v.readyState >= 1 && Math.abs(diff) > 0.05) v.currentTime = clock;
-    if (s.ready) maxSync = Math.max(maxSync, Math.abs(diff));
+    const was = s.ready;
+    const r = step(s.sync, { nowMs: now, clock, dur, time: v.currentTime, readyState: v.readyState, seeking: v.seeking, paused: v.paused, playing, lead: joinLead });
+    if (r.stalled) {                                   // could not get this tile in step; free the decoder and leave the tile alone for a while
+      cooldown.set(s.key, now + 4000); stats.stalls++; stalledNow++; release(s); continue;
+    }
+    if (r.joinedSeconds != null) { joinLead = nextLead(joinLead, r.joinedSeconds); s.lastJoin = r.joinedSeconds; }
+    if (r.lateJoin) { stats.rejoins++; if (s.lastJoin > 1.5) lateNow++; }        // the lead was already raised from the measured join time; but late joins also mean the decoders are behind
+    if (r.pause && !v.paused) v.pause();
+    if (r.seekTo != null) { v.currentTime = r.seekTo; s.dirty = true; }
+    if (r.play && v.paused) v.play().catch(() => {});
+    if (r.rate != null && Math.abs(v.playbackRate - r.rate) > 0.01) v.playbackRate = r.rate;
+    if (r.ready != null) s.ready = r.ready;
+    if (s.ready && !was) { s.dirty = true; s.readyAt = now; stats.joinTotal += now - s.assignedAt; stats.joins++; }
+    if (s.ready) maxSync = Math.max(maxSync, Math.abs(wrapDiff(v.currentTime, clock, dur)));
     const q = v.getVideoPlaybackQuality?.(); if (q) s.dropped = q.droppedVideoFrames;
   }
+  if (stalledNow || lateNow) budgetCtl.stalled(now, stalledNow + lateNow);
   stats.maxSync = maxSync;
-  if (win.active) win.maxSync = Math.max(win.maxSync, maxSync);
+  if (win.active) { win.maxSync = Math.max(win.maxSync, maxSync); win.effMin = Math.min(win.effMin, budgetCtl.eff); }
 }
 
 function upload(texture, video, dirty) {
@@ -301,7 +332,7 @@ function updatePanel(now) {
   const basePx = manifest.base.width * manifest.base.height;
   const fullPx = grid.width * grid.height * fps, decodedPx = mode === 'full' ? fullPx : (active.length * codedPx + basePx) * fps;
   const pct = (100 * decodedPx) / fullPx;
-  $('sSlots').textContent = `${active.length} / ${slots.length}`;
+  $('sSlots').textContent = `${active.length} / ${slots.length}` + (budgetCtl.eff < slots.length ? ` (limited to ${budgetCtl.eff})` : '');
   $('sTiles').textContent = `${Math.min(wantedTiles.length, 999)} / ${stats.tilesDrawn}`;
   $('sPct').textContent = `${pct.toFixed(0)}%`;
   $('pctBar').style.width = `${Math.min(100, pct)}%`;
@@ -323,7 +354,7 @@ function updatePanel(now) {
   // View centre: azimuth 0 is the middle of the picture; yaw is positive to the left.
   const cx = (0.5 - yaw / (2 * Math.PI)) % 1, cxw = ((cx % 1) + 1) % 1;
   mapCtx.fillStyle = '#fff'; mapCtx.beginPath(); mapCtx.arc(cxw * W, (0.5 - pitch / Math.PI) * H, 4, 0, 7); mapCtx.fill();
-  window.__stats = { slots: active.length, budget: slots.length, wanted: wantedTiles.length, drawn: stats.tilesDrawn, pct, starts: stats.starts, joinMs: stats.joins ? stats.joinTotal / stats.joins : null, maxSyncMs: stats.maxSync * 1000, fps: shownFps, yaw, pitch };
+  window.__stats = { slots: active.length, budget: slots.length, wanted: wantedTiles.length, drawn: stats.tilesDrawn, pct, starts: stats.starts, joinMs: stats.joins ? stats.joinTotal / stats.joins : null, maxSyncMs: stats.maxSync * 1000, fps: shownFps, yaw, pitch, eff: budgetCtl.eff, stalls: stats.stalls, rejoins: stats.rejoins, backoffs: budgetCtl.backoffs, lead: joinLead };
 }
 requestAnimationFrame(frame);
 window.__demo = { setTour: (on) => { tourOn = on; tourT = 0; }, setView: (y, p) => { tourOn = false; yaw = y; pitch = p; } };
@@ -334,6 +365,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function setMode(m) {
   if (m === mode) return true;
+  if (m === 'full' && !sourceOk) await recheckSource();      // a stale failure flag must not block a source that is fine
   if (m === 'full' && !sourceOk) { msg(`Normal playback needs the original video at ${sourceUrl} (run_demo.py links it automatically).`); return false; }
   const t = clockVideo().currentTime;
   mode = m;
@@ -351,9 +383,15 @@ async function setMode(m) {
   return true;
 }
 
+async function recheckSource() {
+  sourceOk = await probeSource();
+  $('modeFull').disabled = !sourceOk;
+}
+
 function perfStart(meta) {
   Object.assign(win, { active: true, meta, frames: new FrameStats(), slots: new TimeMean(), sharp: new TimeMean(), area: new TimeMean(), maxSync: 0,
-    startEpoch: Date.now(), v0: videoCounters(), starts0: stats.starts, joinTotal0: stats.joinTotal, joins0: stats.joins });
+    startEpoch: Date.now(), v0: videoCounters(), starts0: stats.starts, joinTotal0: stats.joinTotal, joins0: stats.joins,
+    effMin: budgetCtl.eff, stalls0: stats.stalls, rejoins0: stats.rejoins, backoffs0: budgetCtl.backoffs });
 }
 function perfStop() {
   win.active = false;
@@ -366,12 +404,14 @@ function perfStop() {
     meanSlots, decodedMpxPerS: decodedMpxPerSecond({ mode: win.meta.mode, slots: meanSlots, grid, base: manifest.base, fps, fullWidth: grid.width, fullHeight: grid.height }),
     sharpCoverage: win.meta.mode === 'full' ? 1 : win.sharp.mean(),            // time with every on-screen tile decoded
     sharpArea: win.meta.mode === 'full' ? 1 : win.area.mean(),                // average share of the view drawn from decoded tiles
-    tileStarts: stats.starts - win.starts0, joinMsAvg: joins ? (stats.joinTotal - win.joinTotal0) / joins : null, maxSyncMs: win.maxSync * 1000,
+    tileStarts: stats.starts - win.starts0, tileStalls: stats.stalls - win.stalls0, lateJoins: stats.rejoins - win.rejoins0,
+    budgetBackoffs: budgetCtl.backoffs - win.backoffs0, effectiveBudgetMin: win.meta.mode === 'full' ? null : win.effMin, budgetSetting: slots.length, joinMsAvg: joins ? (stats.joinTotal - win.joinTotal0) / joins : null, maxSyncMs: win.maxSync * 1000,
   };
 }
 
 async function runBench() {
   const duration = Number(params.get('duration')) || 20, rounds = Number(params.get('rounds')) || 2, settle = 3;
+  if (!sourceOk) await recheckSource();
   if (!sourceOk) { msg(`Benchmark needs the original video at ${sourceUrl}.`); return; }
   if (document.hidden) msg('Keep this tab in the foreground while the benchmark runs.');
   const windows = [];
@@ -423,6 +463,7 @@ $('modeFull').onchange = () => setMode('full');
 $('modeFull').disabled = !sourceOk;
 $('bench').onclick = () => runBench();
 window.__demo.setMode = setMode;
+window.__demo.sourceVideo = sourceVideo;
 window.__demo.runBench = runBench;
 if (params.get('mode') === 'full') setMode('full');
 if (params.get('bench')) setTimeout(runBench, 1500);

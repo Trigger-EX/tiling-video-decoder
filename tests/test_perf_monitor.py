@@ -45,6 +45,14 @@ class ReportTest(unittest.TestCase):
         self.assertNotIn("Battery power", r)                    # nothing sampled -> row omitted, not faked
         self.assertIn("avg tile join time 120 ms", r)
 
+    def test_report_says_so_when_the_viewer_had_to_back_off(self):
+        self.assertNotIn("had to back off", pm.build_report(self.bench, self.rows, 4))
+        self.bench["windows"][1].update(tileStalls=3, effectiveBudgetMin=7)
+        r = pm.build_report(self.bench, self.rows, 4)
+        self.assertIn("The viewer had to back off", r)
+        self.assertIn("3 tile(s) failed to join in time", r)
+        self.assertIn("dropped from 12 to 7", r)
+
     def test_report_includes_storage_when_given_paths(self):
         with tempfile.TemporaryDirectory() as d:
             ts = os.path.join(d, "ts"); os.makedirs(ts)

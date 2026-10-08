@@ -224,6 +224,12 @@ def build_report(bench, rows, cores, tileset_dir=None, source_path=None):
             continue
         lines.append("| %s | %s | %s | %s |" % (name, _fmt(a, d, suf), _fmt(b, d, suf), _delta(a, b)))
     jt = agg("tiled", lambda w, m: w["joinMsAvg"])
+    stalls = sum(w.get("tileStalls", 0) for w, _ in per["tiled"])
+    lowest = min([w["effectiveBudgetMin"] for w, _ in per["tiled"] if w.get("effectiveBudgetMin") is not None] or [None], default=None)
+    if stalls or (lowest is not None and lowest < bench["settings"]["budget"]):
+        lines += ["", "**The viewer had to back off:** %d tile(s) failed to join in time and the decoder limit dropped from %d to %s. "
+                  "The machine could not decode that many tiles at once, so the tiled numbers above are for a smaller pool than you asked for." % (
+                      stalls, bench["settings"]["budget"], lowest if lowest is not None else "?")]
     lines += ["", "Tiled only: avg tile join time %s ms, %s tile starts per minute, worst sync error vs base clock %s ms." % (
         _fmt(jt, 0), _fmt(agg("tiled", lambda w, m: 60 * w["tileStarts"] / w["seconds"]), 0), _fmt(max([w["maxSyncMs"] for w, _ in per["tiled"]] or [None]), 0))]
     if len(per["full"]) > 1 and len(per["tiled"]) > 1:

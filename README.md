@@ -136,6 +136,34 @@ decodes 4K easily, expect a small difference; the strong case is a source the ha
 Only the page-side numbers and the system CPU path have been exercised, in a software-rendered headless
 Chromium, whose absolute numbers mean nothing. Power, GPU and the battery path are untested.
 
+## When the machine can't keep up
+
+Every tile is its own decoder, and a machine (or a browser's HEVC path) that decodes slower than real time used to
+get stuck: tiles seeked to "now", could not catch up before "now" moved on, and were seeked again, so none ever
+showed. The viewer now handles that in `demo/slotsync.js` (pure logic, unit-tested):
+
+* **Seek ahead and hold.** A joining tile seeks to where the clock *will be* (now + a learned `lead`), decodes up to that
+  frame while paused, and starts playing when the clock arrives. The lead is learned from real join times (it rises
+  at once on a slow join and falls over a few fast ones), so fast machines see no delay and slow ones stop chasing.
+* **Join pacing.** Only a few tiles start at once (more while things are calm), most important first.
+* **Adaptive decoder limit.** If tiles stall (the decoder produces nothing for 4 s) or keep arriving late, the
+  effective decoder limit drops below your slider setting, and probes back up slowly, waiting longer after each failed
+  probe. The panel shows "limited to N" and the benchmark report says so, so a run that was throttled can't pass
+  for one that wasn't.
+* **Give up on stuck tiles** (free the decoder, don't retry that tile for 4 s) instead of retrying forever.
+
+Measured in a software-rendered Chromium on 4 cores with the browser pinned to fewer cores to starve the decoders
+(16-decoder budget, scripted head motion, drawn tiles averaged over 40 s, old logic vs new):
+
+| browser limited to | old: tiles drawn / seconds with nothing drawn | new |
+|---|---|---|
+| 4 cores (healthy) | 13.3 / 0 s | 12.7 / 0 s (within run-to-run noise) |
+| 1 core | 0.4 / 30 of 40 s | 2.8 / 1 of 40 s, 2.5x fewer decoder starts |
+
+Treat these as a demonstration of the failure mode and the fix, not as speeds: this machine decodes VP9 in software,
+not your HEVC. "Join time" in the viewer and the benchmark now includes the deliberate hold, so it is not comparable
+with numbers from before this change.
+
 ## How it runs on the headset
 
 1. `base.mp4` plays in the existing `ExoVideoPlayer`: it owns the audio and is the master clock (`MediaClock` wraps its position; bump `epoch` on every seek, load and loop).
