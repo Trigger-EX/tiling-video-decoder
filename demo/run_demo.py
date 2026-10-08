@@ -68,6 +68,13 @@ def link_source(dest_dir, path):
     return dest
 
 
+def report_paths(bench_path):
+    """(report.md, samples.json) next to a bench-<stamp>.json, built from the file name only (the folder may contain 'bench-')."""
+    folder, name = os.path.split(bench_path)
+    stem = os.path.splitext(name[len("bench-"):] if name.startswith("bench-") else name)[0]
+    return os.path.join(folder, "report-%s.md" % stem), os.path.join(folder, "samples-%s.json" % stem)
+
+
 def analyze(a, server, url, tileset_dir, source):
     """Serve, open the benchmark page, sample the machine while it runs, then write the report."""
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -90,12 +97,19 @@ def analyze(a, server, url, tileset_dir, source):
     finally:
         mon.stop()
     path, bench = server.perf_results[-1]
-    report = perf_monitor.build_report(bench, mon.rows, mon.cores, tileset_dir, source)
-    rpath = path.replace("bench-", "report-").replace(".json", ".md")
+    if bench.get("error"):                                  # the page gave up (e.g. the original video would not play)
+        print("\nbenchmark stopped: %s" % bench["error"], file=sys.stderr)
+        return 1
+    rpath, spath = report_paths(path)
+    with open(spath, "w") as f:                             # keep the raw measurements even if the report fails
+        json.dump(mon.rows, f)
+    try:
+        report = perf_monitor.build_report(bench, mon.rows, mon.cores, tileset_dir, source)
+    except Exception as e:                                  # noqa: BLE001 - never lose a finished benchmark to a report bug
+        print("could not build the report (%s: %s); raw results kept in %s and %s" % (type(e).__name__, e, path, spath), file=sys.stderr)
+        return 1
     with open(rpath, "w") as f:
         f.write(report)
-    with open(path.replace("bench-", "samples-"), "w") as f:
-        json.dump(mon.rows, f)
     print("\n" + report)
     print("saved: %s" % rpath)
     return 0
@@ -138,7 +152,11 @@ def main():
     p.add_argument("--reference", help="original video for normal playback if --input is not playable in the browser")
     a = p.parse_args()
 
-    root = cachedir.cache_root()
+    try:
+        root = cachedir.cache_root()
+    except RuntimeError as e:
+        print("error:", e, file=sys.stderr)
+        return 2
     if a.clear_cache:
         print("deleted %.0f MB from %s" % (cachedir.clear_cache(root), root))
         return 0
@@ -169,7 +187,14 @@ def main():
         with open(latest, "w") as f:
             json.dump({"name": name, "source": os.path.abspath(src)}, f)
 
-    if a.codec == "hevc":
+    shown_codec = a.codec
+    if a.no_tile:                                           # the tileset being opened may not be the codec on the command line
+        try:
+            with open(os.path.join(out, "manifest.json")) as f:
+                shown_codec = json.load(f)["codec"]
+        except (OSError, ValueError, KeyError):
+            pass
+    if shown_codec == "hevc":
         print("note: HEVC needs a browser that can decode it (Chrome, Edge, Safari). On Firefox for Linux use: run_demo.py --codec h264")
     source_link = link_source(out, a.reference or src)
     server = serve.make_server(HERE, a.port, mounts={"/tilesets": tilesets_root})

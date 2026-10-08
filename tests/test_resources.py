@@ -100,5 +100,22 @@ class RunJobsTest(unittest.TestCase):
         q.err_file.close()
 
 
+class SpawnFailureTest(unittest.TestCase):
+    def test_a_program_that_cannot_start_does_not_leak_the_stderr_file(self):
+        import gc
+        import warnings
+        real = resources.low_priority_command
+        resources.low_priority_command = lambda cmd: ["/definitely/not/a/launcher"] + cmd      # make Popen itself fail
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with self.assertRaises(OSError):
+                    resources.spawn_low_priority(["true"])
+                gc.collect()
+        finally:
+            resources.low_priority_command = real
+        self.assertEqual([w for w in caught if issubclass(w.category, ResourceWarning)], [])
+
+
 if __name__ == "__main__":
     unittest.main()

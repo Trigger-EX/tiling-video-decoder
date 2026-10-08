@@ -141,7 +141,11 @@ def spawn_low_priority(cmd, nice=15):
         kw["creationflags"] = 0x00004000          # BELOW_NORMAL_PRIORITY_CLASS
     else:
         kw["preexec_fn"] = lambda: os.nice(nice)
-    p = subprocess.Popen(low_priority_command(cmd) if os.name != "nt" else cmd, stdout=subprocess.DEVNULL, stderr=err, **kw)
+    try:
+        p = subprocess.Popen(low_priority_command(cmd) if os.name != "nt" else cmd, stdout=subprocess.DEVNULL, stderr=err, **kw)
+    except BaseException:
+        err.close()
+        raise
     p.err_file = err
     return p
 

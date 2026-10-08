@@ -81,5 +81,42 @@ class ServerTest(unittest.TestCase):
                 srv.shutdown(); srv.server_close()
 
 
+class ReportRobustnessTest(ReportTest):
+    def test_report_survives_null_numbers_from_a_hidden_tab(self):
+        # A background tab stops requestAnimationFrame: the page then sends nulls for everything it could not measure.
+        self.bench["windows"][1].update(sharpCoverage=None, sharpArea=None, frameMs=dict(p50=None, p95=None, p99=None, max=None), joinMsAvg=None)
+        r = pm.build_report(self.bench, self.rows, 4)
+        self.assertIn("| Browser CPU (cores busy) | 2.00 | 1.00 | -50% |", r)    # the OS-side numbers are still reported
+        self.assertIn("n/a", r)
+
+    def test_report_file_names_come_from_the_file_name_not_the_folder(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "demo"))
+        import run_demo
+        self.assertEqual(run_demo.report_paths("/home/me/bench-runs/perf/bench-1700000000.json"),
+                         ("/home/me/bench-runs/perf/report-1700000000.md", "/home/me/bench-runs/perf/samples-1700000000.json"))
+
+
+class BrowserProcessMatchTest(unittest.TestCase):
+    def test_firefox_helpers_with_renamed_process_names_are_counted_under_psutil(self):
+        import types
+        procs = [
+            {"pid": 1, "name": "firefox", "exe": "/usr/lib/firefox/firefox", "cmdline": ["/usr/lib/firefox/firefox"]},
+            {"pid": 2, "name": "Isolated Web Co", "exe": "/usr/lib/firefox/firefox", "cmdline": ["/usr/lib/firefox/firefox", "-contentproc"]},
+            {"pid": 3, "name": "RDD Process", "exe": None, "cmdline": ["/usr/lib/firefox/firefox", "-contentproc"]},
+            {"pid": 4, "name": "python3", "exe": "/usr/bin/python3", "cmdline": ["python3", "x.py"]},
+        ]
+        fake = types.ModuleType("psutil")
+        fake.process_iter = lambda attrs: [types.SimpleNamespace(info=p) for p in procs]
+        old = sys.modules.get("psutil")
+        sys.modules["psutil"] = fake
+        try:
+            self.assertEqual(sorted(pm.browser_pids()), [1, 2, 3])
+        finally:
+            if old is None:
+                del sys.modules["psutil"]
+            else:
+                sys.modules["psutil"] = old
+
+
 if __name__ == "__main__":
     unittest.main()

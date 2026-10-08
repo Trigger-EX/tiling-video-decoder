@@ -34,13 +34,15 @@ object DecoderProbe {
                 val surface = Surface(tex)
                 textures.add(tex)
                 surfaces.add(surface)
+                var c: MediaCodec? = null
                 try {
-                    val c = MediaCodec.createDecoderByType(mime)
-                    codecs.add(c)
+                    c = MediaCodec.createDecoderByType(mime)
                     c.configure(MediaFormat.createVideoFormat(mime, width, height), surface, null, 0)
                     c.start()
+                    codecs.add(c)              // counted only once it is really running
                 } catch (e: Exception) {
-                    return Result(name?.name, reported, codecs.size - 1)
+                    runCatching { c?.release() }   // created but never started: still must be released
+                    return Result(name?.name, reported, codecs.size)
                 }
             }
             return Result(name?.name, reported, codecs.size)

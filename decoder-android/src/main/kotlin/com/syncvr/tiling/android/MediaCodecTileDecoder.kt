@@ -44,6 +44,8 @@ class MediaCodecTileDecoder(
     private val lock = Object()
     private var requested: TileId? = null
     private var released = false
+    /** The tile whose last attempt failed; not retried until the tile is assigned again (see [failTile]). */
+    @Volatile private var failedTile: TileId? = null
 
     // Written by the worker, read by the renderer thread.
     @Volatile private var shownTile: TileId? = null
@@ -58,6 +60,7 @@ class MediaCodecTileDecoder(
         synchronized(lock) {
             if (requested == tile) return
             requested = tile
+            failedTile = null          // an explicit new assignment is a new chance
             shownTile = null
             visibleFromNanos = Long.MAX_VALUE
             lock.notifyAll()
@@ -74,7 +77,7 @@ class MediaCodecTileDecoder(
     // ---- worker thread state ----
     private var extractor: MediaExtractor? = null
     private var codec: MediaCodec? = null
-    private var codecKey: List<ByteArray>? = null
+    private var codecKey: List<String>? = null
     private var current: TileId? = null
     private var seenEpoch = Int.MIN_VALUE
     private var catchingUp = true
@@ -88,23 +91,28 @@ class MediaCodecTileDecoder(
                 val wanted: TileId?
                 synchronized(lock) {
                     if (released) return
-                    if (requested == null || (requested == current && outputDone && seenEpoch == clock.epoch)) {
-                        if (requested == null && current != null) stopTile()
+                    val idle = requested == null || requested == failedTile ||
+                        (requested == current && outputDone && seenEpoch == clock.epoch)
+                    if (idle) {
                         lock.wait(20)
                         if (released) return
                     }
                     wanted = requested
                 }
-                if (wanted != current) {
-                    stopTile()
-                    if (wanted != null) startTile(wanted)
+                // Everything slow (flush, extractor release, codec start) happens outside the lock: the renderer
+                // thread reads `tile` and `isShowingFrames` every frame and must never wait for it.
+                try {
+                    if (wanted != current) {
+                        stopTile()
+                        if (wanted != null && wanted != failedTile) startTile(wanted)
+                    }
+                    if (current != null) pump()
+                } catch (e: Exception) {
+                    // One bad tile (missing or truncated file, codec error) must not kill this slot for the rest of
+                    // the session: clean up, remember the tile so it is not retried in a tight loop, and carry on.
+                    failTile(wanted ?: current)
                 }
-                if (current != null) pump()
             }
-        } catch (e: Exception) {
-            // A failing tile just never shows frames; the base layer stays visible.
-            stopTile()
-            synchronized(lock) { requested = null }
         } finally {
             stopTile()
             codec?.let { runCatching { it.stop() }; runCatching { it.release() } }
@@ -112,8 +120,17 @@ class MediaCodecTileDecoder(
         }
     }
 
+    private fun failTile(tile: TileId?) {
+        stopTile()
+        codec?.let { runCatching { it.stop() }; runCatching { it.release() } }
+        codec = null
+        codecKey = null
+        failedTile = tile
+    }
+
     private fun startTile(tile: TileId) {
         val ex = MediaExtractor()
+        extractor = ex                    // owned from here on: stopTile()/failTile() release it on any failure below
         ex.setDataSource(pathOf(tile))
         val track = (0 until ex.trackCount).first {
             ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!.startsWith("video/")
@@ -125,13 +142,19 @@ class MediaCodecTileDecoder(
             codec!!.flush()
         } else {
             codec?.let { runCatching { it.stop() }; runCatching { it.release() } }
+            codec = null
+            codecKey = null
             val c = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
-            c.configure(format, surface, null, 0)
-            c.start()
+            try {
+                c.configure(format, surface, null, 0)
+                c.start()
+            } catch (e: Exception) {
+                runCatching { c.release() }
+                throw e
+            }
             codec = c
             codecKey = key
         }
-        extractor = ex
         current = tile
         seenEpoch = Int.MIN_VALUE // forces the initial seek in pump()
     }
@@ -183,12 +206,10 @@ class MediaCodecTileDecoder(
 
         val out = c.dequeueOutputBuffer(info, 5_000)
         if (out < 0) return
-        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-            c.releaseOutputBuffer(out, false)
-            outputDone = true
-            return
-        }
-        present(c, out, tile)
+        val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+        if (eos) outputDone = true
+        // Some decoders tag their LAST real frame with the end-of-stream flag; only an empty buffer is a pure marker.
+        if (info.size > 0 || !eos) present(c, out, tile) else c.releaseOutputBuffer(out, false)
     }
 
     private fun present(c: MediaCodec, index: Int, tile: TileId) {
@@ -228,14 +249,22 @@ class MediaCodecTileDecoder(
 
     private fun tile(): TileId? = synchronized(lock) { requested }
 
-    private fun codecKeyOf(f: MediaFormat): List<ByteArray> {
-        val parts = mutableListOf<ByteArray>()
-        parts.add(f.getString(MediaFormat.KEY_MIME)!!.toByteArray())
-        parts.add("${f.getInteger(MediaFormat.KEY_WIDTH)}x${f.getInteger(MediaFormat.KEY_HEIGHT)}".toByteArray())
-        for (name in listOf("csd-0", "csd-1")) {
-            val b: ByteBuffer? = f.getByteBuffer(name)
-            parts.add(b?.let { ByteArray(it.remaining()).also { arr -> it.duplicate().get(arr) } } ?: ByteArray(0))
+    /**
+     * What makes two tile files decodable by the same running codec. Strings, not ByteArrays: arrays compare by
+     * identity, so a key made of them never matched and every tile change recreated the hardware codec.
+     */
+    private fun codecKeyOf(f: MediaFormat): List<String> {
+        fun hex(b: ByteBuffer?): String {
+            if (b == null) return ""
+            val bytes = ByteArray(b.remaining())
+            b.duplicate().get(bytes)
+            return bytes.joinToString("") { "%02x".format(it) }
         }
-        return parts
+        return listOf(
+            f.getString(MediaFormat.KEY_MIME)!!,
+            "${f.getInteger(MediaFormat.KEY_WIDTH)}x${f.getInteger(MediaFormat.KEY_HEIGHT)}",
+            hex(f.getByteBuffer("csd-0")),
+            hex(f.getByteBuffer("csd-1")),
+        )
     }
 }

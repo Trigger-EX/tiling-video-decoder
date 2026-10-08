@@ -12,11 +12,17 @@ import argparse
 import json
 import os
 import re
-import resource
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import atexit
+
+try:
+    import resource
+except ImportError:                # Windows: no child CPU accounting, fall back to wall-clock time
+    resource = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tiler  # noqa: E402
@@ -24,13 +30,15 @@ import tiler  # noqa: E402
 
 def cpu_run(cmd):
     """Runs cmd, returns (wall, cpu seconds of the child tree, stderr)."""
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True)
     wall = time.time() - t0
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
     if r.returncode:
         raise RuntimeError("%s\n%s" % (" ".join(cmd), r.stderr[-800:]))
+    if not resource:
+        return wall, wall, r.stderr
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
     return wall, (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime), r.stderr
 
 
@@ -53,6 +61,7 @@ def main():
     a = p.parse_args()
     fps, gop = 30, 30
     tmp = tempfile.mkdtemp(prefix="tilebench_")
+    atexit.register(shutil.rmtree, tmp, True)             # the lossless reference clip is large; never leave it behind
     ref = os.path.join(tmp, "ref.mkv")
     if a.input:
         w, h, _, _ = tiler.probe(a.input)

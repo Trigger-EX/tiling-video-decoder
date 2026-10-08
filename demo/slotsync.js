@@ -25,8 +25,11 @@ export function nextLead(lead, joinSeconds) {
   return Math.max(MIN_LEAD, Math.min(MAX_LEAD, next));
 }
 
+// On a short clip a lead of more than about half its length would put the target "behind" the clock on the loop.
+export const clampLead = (lead, dur) => (dur > 0 ? Math.min(lead, dur * 0.4) : lead);
+
 export function newSync(nowMs, clock, dur, lead) {
-  return { phase: 'loading', target: mod(clock + lead, dur), assignedAt: nowMs, phaseStart: nowMs, holdStart: nowMs, rejoins: 0, lastRejoin: -1e9, lagSince: null, ready: false };
+  return { phase: 'loading', target: mod(clock + clampLead(lead, dur), dur), assignedAt: nowMs, phaseStart: nowMs, holdStart: nowMs, rejoins: 0, lastRejoin: -1e9, lagSince: null, ready: false };
 }
 
 /**
@@ -47,7 +50,7 @@ export function step(st, i) {
     st.rejoins++;
     if (st.rejoins > 3) { out.stalled = true; return; }
     st.phase = 'loading'; st.phaseStart = i.nowMs; st.lastRejoin = i.nowMs; st.lagSince = null; st.ready = false;
-    st.target = mod(i.clock + i.lead, i.dur);
+    st.target = mod(i.clock + clampLead(i.lead, i.dur), i.dur);
     out.pause = true; out.seekTo = st.target; out.ready = false; out.lateJoin = true;
   };
 
@@ -60,10 +63,15 @@ export function step(st, i) {
 
   if (st.phase === 'holding') {
     const wait = wrapDiff(st.target, i.clock, i.dur);                 // seconds until the clock reaches the held frame
-    if (wait < -READY_TOLERANCE) { rejoin(); return out; }            // arrived late: try again with a longer lead
-    if (!i.playing) {                                                 // user paused: show the held frame once it matches
-      out.ready = Math.abs(wait) <= READY_TOLERANCE; st.ready = out.ready; return out;
+    if (!i.playing) {
+      // Paused: the clock is not moving, so waiting for it would never end. Aim at the clock itself instead.
+      if (Math.abs(wait) > READY_TOLERANCE) {
+        st.phase = 'loading'; st.phaseStart = i.nowMs; st.target = mod(i.clock, i.dur); st.ready = false;
+        out.pause = true; out.seekTo = st.target; out.ready = false; return out;
+      }
+      out.ready = true; st.ready = true; return out;
     }
+    if (wait < -READY_TOLERANCE) { rejoin(); return out; }            // arrived late: try again with a longer lead
     out.ready = wait <= READY_TOLERANCE; st.ready = out.ready;       // a frame a little early is better than the blurry base
     if (wait <= PLAY_WINDOW) { st.phase = 'playing'; st.lagSince = null; if (i.paused) out.play = true; }
     return out;
@@ -83,6 +91,7 @@ export function step(st, i) {
   }
   if (diff >= -READY_TOLERANCE) {
     st.lagSince = null; out.ready = true; st.ready = true;
+    if (st.rejoins && i.nowMs - st.lastRejoin > 10000) st.rejoins = 0;     // healthy for a while: earlier hiccups don't count against it
     out.rate = Math.max(0.9, Math.min(1.1, 1 - diff * 0.5));
     return out;
   }

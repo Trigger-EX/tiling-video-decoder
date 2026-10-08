@@ -131,5 +131,66 @@ class RangeCapTest(unittest.TestCase):
                 srv.shutdown(); srv.server_close()
 
 
+class CacheSafetyTest(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("TILING_CACHE_DIR", None)
+
+    def test_a_directory_with_someone_elses_files_is_never_adopted_or_cleared(self):
+        with tempfile.TemporaryDirectory() as d:
+            precious = os.path.join(d, "Documents")
+            os.makedirs(precious)
+            with open(os.path.join(precious, "thesis.txt"), "w") as f:
+                f.write("do not delete")
+            os.environ["TILING_CACHE_DIR"] = precious
+            with self.assertRaises(RuntimeError):
+                cachedir.cache_root()                              # run_demo --clear-cache calls this first
+            self.assertEqual(sorted(os.listdir(precious)), ["thesis.txt"])      # and left no marker behind
+
+    def test_an_existing_empty_directory_or_our_own_cache_is_fine(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["TILING_CACHE_DIR"] = d
+            root = cachedir.cache_root()
+            self.assertEqual(cachedir.cache_root(), root)          # second call: now marked, still fine
+            os.makedirs(os.path.join(root, "tilesets"))
+            self.assertEqual(cachedir.cache_root(), root)          # non-empty but ours
+
+
+class MountSafetyAndSuffixRangeTest(unittest.TestCase):
+    def test_backslash_and_drive_segments_cannot_leave_the_mount(self):
+        with tempfile.TemporaryDirectory() as web, tempfile.TemporaryDirectory() as cache:
+            with open(os.path.join(cache, "ok.txt"), "w") as f:
+                f.write("fine")
+            with open(os.path.join(web, "..secret"), "w") as f:
+                f.write("x")
+            srv = serve.make_server(web, 0, mounts={"/t": cache})
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            base = "http://127.0.0.1:%d" % srv.server_address[1]
+            try:
+                self.assertEqual(urllib.request.urlopen(base + "/t/ok.txt").read(), b"fine")
+                for evil in ("/t/..%5C..%5Cx", "/t/a%5Cb", "/t/C:%5Cwindows", "/t/%2e%2e/%2e%2e/x", "/t/c:/x"):
+                    with self.assertRaises(urllib.error.HTTPError, msg=evil):
+                        urllib.request.urlopen(base + evil)
+            finally:
+                srv.shutdown(); srv.server_close()
+
+    def test_suffix_range_is_capped_like_any_other(self):
+        with tempfile.TemporaryDirectory() as web:
+            with open(os.path.join(web, "v.mp4"), "wb") as f:
+                f.write(bytes(i % 251 for i in range(5000)))
+            old, serve.MAX_CHUNK = serve.MAX_CHUNK, 1000
+            srv = serve.make_server(web, 0)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:%d/v.mp4" % srv.server_address[1], headers={"Range": "bytes=-4000"}))
+                body = r.read()
+                self.assertEqual(r.status, 206)
+                self.assertEqual(len(body), 1000)                                  # not the 4000 asked for
+                self.assertEqual(r.headers["Content-Range"], "bytes 1000-1999/5000")   # and it says exactly what it sent
+                self.assertEqual(body, bytes(i % 251 for i in range(1000, 2000)))
+            finally:
+                serve.MAX_CHUNK = old
+                srv.shutdown(); srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,9 +40,12 @@ def browser_pids():
     pids = []
     try:
         import psutil
-        for p in psutil.process_iter(["pid", "name", "exe"]):
-            n = (p.info.get("name") or "").lower()
-            if any(b in n for b in BROWSERS):
+        for p in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+            # Firefox helpers are renamed ("Isolated Web Co", "RDD Process", ...) but run the same executable, so match
+            # the executable and argv[0] as well as the process name.
+            cmd = p.info.get("cmdline") or []
+            names = [p.info.get("name") or "", os.path.basename(p.info.get("exe") or ""), os.path.basename(cmd[0]) if cmd else ""]
+            if any(b in n.lower() for n in names for b in BROWSERS):
                 pids.append(p.info["pid"])
         return pids
     except ImportError:
@@ -190,7 +193,12 @@ def build_report(bench, rows, cores, tileset_dir=None, source_path=None):
         per[w["mode"]].append((w, sysm))
 
     def agg(mode, fn):
-        return _mean(fn(w, m) for w, m in per[mode])
+        def safe(w, m):
+            try:
+                return fn(w, m)
+            except (TypeError, KeyError, ZeroDivisionError):     # e.g. the tab was hidden, so some numbers are null
+                return None
+        return _mean(safe(w, m) for w, m in per[mode])
 
     metrics = [
         ("Browser CPU (cores busy)", lambda w, m: m["browser_cores"], 2, ""),
@@ -205,7 +213,7 @@ def build_report(bench, rows, cores, tileset_dir=None, source_path=None):
         ("Video frames dropped (% of decoded)", lambda w, m: 100 * w["videoFramesDropped"] / w["videoFramesTotal"] if w["videoFramesTotal"] else None, 1, "%"),
         ("Decoded pixels (modeled)", lambda w, m: w["decodedMpxPerS"], 0, " Mpx/s"),
         ("Decoder instances (mean)", lambda w, m: 1 if w["mode"] == "full" else w["meanSlots"] + 1, 1, ""),
-        ("View drawn at full resolution (average)", lambda w, m: 100 * w.get("sharpArea", w["sharpCoverage"]), 1, "%"),
+        ("View drawn at full resolution (average)", lambda w, m: 100 * (w["sharpArea"] if w.get("sharpArea") is not None else w["sharpCoverage"]), 1, "%"),
         ("Time with the whole view at full resolution", lambda w, m: 100 * w["sharpCoverage"], 1, "%"),
     ]
     t = bench["tileset"]

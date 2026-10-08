@@ -33,8 +33,14 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
         clean = urllib.parse.urlsplit(path).path
         for prefix, root in getattr(self.server, "mounts", {}).items():
             if clean.startswith(prefix + "/"):
-                rel = posixpath.normpath(urllib.parse.unquote(clean[len(prefix):])).lstrip("/")   # normpath: no ".." escapes
-                return os.path.join(root, *[part for part in rel.split("/") if part])
+                rel = posixpath.normpath(urllib.parse.unquote(clean[len(prefix):])).lstrip("/")
+                parts = [part for part in rel.split("/") if part]
+                # Refuse anything that could mean "go up" or "another drive" on any OS (a backslash is a separator on
+                # Windows, so ..\..\x would otherwise climb out of the mount there).
+                bad = ("\\", ":", "\0", os.sep, os.altsep or "\\")
+                if any(p == ".." or any(ch in p for ch in bad) for p in parts):
+                    return os.path.join(root, ".__no_such_path__")
+                return os.path.join(root, *parts)
         return super().translate_path(path)
 
     def do_POST(self):
@@ -72,8 +78,8 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
         else:
             start = int(m.group(1))
             end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
-            if MAX_CHUNK:
-                end = min(end, start + MAX_CHUNK - 1)
+        if MAX_CHUNK:                       # also for "bytes=-N" (the last N bytes): one answer must never be unbounded
+            end = min(end, start + MAX_CHUNK - 1)
         if start >= size or start > end:
             self.send_error(416)
             return None

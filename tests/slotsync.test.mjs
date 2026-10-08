@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { step, newSync, nextLead, wrapDiff, AdaptiveBudget, STALL_MS, MAX_LEAD, MIN_LEAD } from '../demo/slotsync.js';
+import { step, newSync, nextLead, wrapDiff, clampLead, AdaptiveBudget, STALL_MS, MAX_LEAD, MIN_LEAD } from '../demo/slotsync.js';
 
 const base = { dur: 30, playing: true, paused: true, readyState: 4, seeking: false, lead: 0.6 };
 const at = (nowMs, clock, extra = {}) => ({ ...base, nowMs, clock, time: clock, ...extra });
@@ -88,4 +88,42 @@ test('adaptive budget backs off on stalls, probes upward slowly, and waits longe
   b.setMax(8); assert.equal(b.eff, 8);                                  // user changes the budget: respected
   assert.ok(b.maxJoining(60000 + 1000) >= 2 && b.maxJoining(60000 + 1000) <= 4);   // just after trouble: tight
   assert.equal(b.maxJoining(60000 + 20000), 8);                                      // calm for 15 s: generous
+});
+
+test('re-join budget recovers: hiccups spread over a long session never add up to a stall', () => {
+  const st = newSync(0, 10, 30, 0.3); st.phase = 'playing'; st.ready = true;
+  let t = 1000, stalled = false;
+  for (let hiccup = 0; hiccup < 8; hiccup++) {                              // eight separate lags, a minute apart
+    let r = step(st, { ...at(t, 20, { paused: false }), time: 19.5 });       // lagging 0.5 s ...
+    t += 1500;
+    r = step(st, { ...at(t, 21.5, { paused: false }), time: 21.0 });         // ... still lagging 1.5 s later: re-join
+    assert.equal(r.lateJoin, true);
+    st.phase = 'playing'; st.ready = true;                                   // the re-join succeeded
+    t += 12000;
+    step(st, { ...at(t, 40, { paused: false }), time: 40.0 });               // healthy for 12 s: counter clears
+    t += 40000;
+    if (r.stalled) stalled = true;
+  }
+  assert.equal(stalled, false);
+  assert.ok(st.rejoins <= 1);
+});
+
+test('a tile that joins while playback is paused re-aims at the frozen clock and becomes ready (no stall loop)', () => {
+  const st = newSync(0, 5, 30, 0.5);                                         // target 5.5
+  const p = (nowMs, extra = {}) => ({ ...at(nowMs, 5, { playing: false, paused: true, ...extra }) });
+  let r = step(st, p(300));                                                  // decoded, but the paused clock is 0.5 s away
+  assert.equal(r.seekTo, 5); assert.equal(st.phase, 'loading'); assert.equal(r.ready, false);
+  r = step(st, p(700));                                                      // frame at the clock arrived
+  assert.equal(r.ready, true);
+  assert.notEqual(step(st, p(9000)).stalled, true);                          // and it stays put, however long the pause lasts
+});
+
+test('a lead longer than the clip cannot put the target behind the clock', () => {
+  assert.equal(clampLead(3, 5), 2);
+  assert.equal(clampLead(0.5, 30), 0.5);
+  const st = newSync(0, 1, 5, 3);                                            // 5 s clip, 3 s lead requested
+  assert.ok(Math.abs(st.target - 3) < 1e-9);                                 // 1 + 2, not 4
+  step(st, at(200, 1.2, { dur: 5, lead: 3 }));
+  const r = step(st, at(400, 1.4, { dur: 5, lead: 3 }));
+  assert.ok(!r.lateJoin && !r.stalled);
 });

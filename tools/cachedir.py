@@ -21,8 +21,12 @@ def cache_root():
         root = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "tiling-video-decoder", "cache")
     else:
         root = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "tiling-video-decoder")
-    os.makedirs(root, exist_ok=True)
     marker = os.path.join(root, MARKER)
+    if os.path.isdir(root) and not os.path.exists(marker) and os.listdir(root):
+        # Stamping the marker here would make clear_cache() treat someone's existing folder as ours and empty it.
+        raise RuntimeError("%s already contains files that are not a tiling-video-decoder cache. Point TILING_CACHE_DIR "
+                           "at a new or empty directory." % root)
+    os.makedirs(root, exist_ok=True)
     if not os.path.exists(marker):
         open(marker, "w").close()
     return root

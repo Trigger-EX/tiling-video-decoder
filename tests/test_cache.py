@@ -97,5 +97,61 @@ class CacheTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(out, "manifest.json")))
 
 
+class RobustnessTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = os.path.join(self.tmp.name, "v.mp4")
+        make_video(self.src)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_output_folder_names_with_glob_characters_are_cleaned_correctly(self):
+        out = os.path.join(self.tmp.name, "my video [360] *")
+        run(self.src, out)
+        before = mtimes(out)["tiles/t_0_0.mp4"]
+        run(self.src, out, "--gop-seconds", "0.5")                         # new settings: old tiles must really be replaced
+        self.assertNotEqual(mtimes(out)["tiles/t_0_0.mp4"], before)
+        with open(os.path.join(out, "manifest.json")) as f:
+            self.assertEqual(json.load(f)["gopFrames"], 15)
+        self.assertFalse([f for f in os.listdir(os.path.join(out, "tiles")) if f.endswith(".part")])
+
+    def test_state_and_manifest_are_written_atomically(self):
+        target = os.path.join(self.tmp.name, "s.json")
+        tiler._write_json_atomic(target, {"a": 1})
+        tiler._write_json_atomic(target, {"a": 2}, indent=2)
+        with open(target) as f:
+            self.assertEqual(json.load(f), {"a": 2})
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["s.json", "v.mp4"])      # no .part left over
+
+    def test_frame_rate_falls_back_when_r_frame_rate_is_zero(self):
+        real = tiler.run
+        try:
+            def fake(cmd, payload):
+                tiler.run = lambda c: json.dumps({"streams": [payload], "format": {"duration": "4.0"}})
+                return tiler.probe("x.mp4")
+            ok = fake(None, {"width": 640, "height": 320, "r_frame_rate": "0/0", "avg_frame_rate": "30000/1001"})
+            self.assertAlmostEqual(ok[2], 29.97, places=2)
+            with self.assertRaises(ValueError):
+                fake(None, {"width": 640, "height": 320, "r_frame_rate": "0/0", "avg_frame_rate": "0/0"})
+        finally:
+            tiler.run = real
+
+    def test_missing_ffmpeg_is_a_clear_error_not_a_traceback(self):
+        import io
+        from contextlib import redirect_stderr
+        old = os.environ["PATH"]
+        os.environ["PATH"] = self.tmp.name                                 # a folder with no programs in it
+        try:
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                rc = tiler.main([self.src, os.path.join(self.tmp.name, "o")] + ARGS)
+        finally:
+            os.environ["PATH"] = old
+        self.assertEqual(rc, 1)
+        self.assertIn("not found", buf.getvalue())
+        self.assertNotIn("Traceback", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

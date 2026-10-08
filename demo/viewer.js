@@ -76,7 +76,7 @@ const adaptive = () => $('adaptive').checked;
 const cooldown = new Map();                     // tile key -> time before which it will not be started again
 let joinLead = 0.5;                             // seconds ahead of the clock a joining tile seeks to (learned)
 function makeSlot() {
-  const s = { video: makeVideo(), tile: null, key: null, assignedAt: 0, readyAt: 0, ready: false, dirty: false, frames: 0, texture: createTexture(), dropped: 0, sync: null, releasing: false, lastJoin: 0 };
+  const s = { video: makeVideo(), tile: null, key: null, assignedAt: 0, readyAt: 0, ready: false, dirty: false, frames: 0, texture: createTexture(), dropped: 0, sync: null, releasing: false, lastJoin: 0, joined: false };
   if ('requestVideoFrameCallback' in s.video) {
     const onFrame = () => { s.dirty = true; s.frames++; s.video.requestVideoFrameCallback(onFrame); };
     s.video.requestVideoFrameCallback(onFrame);
@@ -94,7 +94,7 @@ function setBudget(n) {
 function assign(s, key, now) {
   const [row, col] = key.split('_').map(Number);
   const dur = baseVideo.duration || manifest.durationSeconds;
-  s.tile = { row, col }; s.key = key; s.ready = false; s.frames = 0; s.dirty = true; s.assignedAt = now;
+  s.tile = { row, col }; s.key = key; s.ready = false; s.joined = false; s.frames = 0; s.dirty = true; s.assignedAt = now;
   s.sync = newSync(now, baseVideo.currentTime, dur, joinLead);
   s.video.playbackRate = 1;
   s.video.src = base + fileOf[key] + '#t=' + s.sync.target.toFixed(3);   // start straight at the target; no separate seek after loading
@@ -274,7 +274,10 @@ function updateSlots(now) {
     if (r.play && v.paused) v.play().catch(() => {});
     if (r.rate != null && Math.abs(v.playbackRate - r.rate) > 0.01) v.playbackRate = r.rate;
     if (r.ready != null) s.ready = r.ready;
-    if (s.ready && !was) { s.dirty = true; s.readyAt = now; stats.joinTotal += now - s.assignedAt; stats.joins++; }
+    if (s.ready && !was) {
+      s.dirty = true; s.readyAt = now;
+      if (!s.joined) { s.joined = true; stats.joinTotal += now - s.assignedAt; stats.joins++; }   // a join is the FIRST time a tile shows; later re-readies are not joins
+    }
     if (s.ready) maxSync = Math.max(maxSync, Math.abs(wrapDiff(v.currentTime, clock, dur)));
     const q = v.getVideoPlaybackQuality?.(); if (q) s.dropped = q.droppedVideoFrames;
   }
@@ -370,29 +373,47 @@ const win = { active: false, maxSync: 0 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const withTimeout = (p, ms, fallback) => Promise.race([p, new Promise((r) => setTimeout(() => r(fallback), ms))]);
 
+let switching = false;
 async function setMode(m) {
-  if (m === mode) return true;
+  const syncRadios = () => { $('modeFull').checked = mode === 'full'; $('modeTiled').checked = mode === 'tiled'; };
+  if (m === mode) { syncRadios(); return true; }
+  if (switching) { syncRadios(); return false; }                          // one switch at a time
   if (m === 'full' && !sourceOk) await recheckSource();      // a stale failure flag must not block a source that is fine
-  if (m === 'full' && !sourceOk) { msg(`Normal playback needs the original video at ${sourceUrl} (run_demo.py links it automatically).`); return false; }
-  const t = clockVideo().currentTime;
-  mode = m;
-  $('modeFull').checked = m === 'full'; $('modeTiled').checked = m === 'tiled';
-  for (const s of slots) if (s.key) release(s);
-  const [target, other] = m === 'full' ? [sourceVideo, baseVideo] : [baseVideo, sourceVideo];
-  unload(other);
-  target.muted = muted;
-  target.src = m === 'full' ? sourceUrl : base + manifest.base.file;
-  const loaded = await withTimeout(new Promise((r) => { target.addEventListener('loadedmetadata', () => r(true), { once: true }); target.addEventListener('error', () => r(false), { once: true }); }), 10000, false);
-  if (!loaded) {                                  // never hang: say what happened and go back
-    msg(`The ${m === 'full' ? 'original' : 'base-layer'} video did not load within 10 s.`);
-    unload(target); mode = m === 'full' ? 'tiled' : mode;
-    if (m === 'full') { sourceOk = false; await setMode('tiled'); }
-    return false;
+  if (m === 'full' && !sourceOk) { msg(`Normal playback needs the original video at ${sourceUrl} (run_demo.py links it automatically).`); syncRadios(); return false; }
+  switching = true;
+  try {
+    // Load and position the new video while the current one keeps playing; only swap once it is really there. If
+    // it fails or times out nothing has been torn down, so the viewer is exactly as it was.
+    const [target, other] = m === 'full' ? [sourceVideo, baseVideo] : [baseVideo, sourceVideo];
+    const t = clockVideo().currentTime;
+    target.muted = muted;
+    target.src = m === 'full' ? sourceUrl : base + manifest.base.file;
+    const loaded = await withTimeout(new Promise((r) => { target.addEventListener('loadedmetadata', () => r(true), { once: true }); target.addEventListener('error', () => r(false), { once: true }); }), 10000, false);
+    if (!loaded) {
+      msg(`The ${m === 'full' ? 'original' : 'base-layer'} video did not load within 10 s.`);
+      unload(target);
+      if (m === 'full') { sourceOk = false; $('modeFull').disabled = true; }
+      syncRadios();
+      return false;
+    }
+    target.currentTime = t % (target.duration || t + 1);
+    if (playing) await target.play().catch(() => {});
+    await withTimeout(new Promise((r) => ('requestVideoFrameCallback' in target ? target.requestVideoFrameCallback(() => r()) : setTimeout(r, 400))), 3000, null);
+    mode = m;                                                              // swap: tiles now plan against the new clock
+    for (const s of slots) if (s.key) release(s);
+    unload(other);
+    syncRadios();
+    return true;
+  } finally {
+    switching = false;
   }
-  target.currentTime = t % (target.duration || t + 1);
-  if (playing) await target.play().catch(() => {});
-  await withTimeout(new Promise((r) => ('requestVideoFrameCallback' in target ? target.requestVideoFrameCallback(() => r()) : setTimeout(r, 400))), 3000, null);
-  return true;
+}
+
+// Tell the launcher the run is over (it would otherwise wait for results that will never come).
+async function benchAbort(text) {
+  $('benchStatus').textContent = text;
+  tourOn = false; tourSpeed = 1;
+  try { await fetch('/__perf', { method: 'POST', body: JSON.stringify({ error: text }) }); } catch { /* no analyzer running */ }
 }
 
 async function recheckSource() {
@@ -431,13 +452,13 @@ async function runBench() {
 async function runBenchInner() {
   const duration = Number(params.get('duration')) || 20, rounds = Number(params.get('rounds')) || 2, settle = 3;
   if (!sourceOk) await recheckSource();
-  if (!sourceOk) { msg(`Benchmark needs the original video at ${sourceUrl}.`); return; }
+  if (!sourceOk) { msg(`Benchmark needs the original video at ${sourceUrl}.`); await benchAbort(`Benchmark needs the original video at ${sourceUrl}.`); return; }
   if (document.hidden) msg('Keep this tab in the foreground while the benchmark runs.');
   const windows = [];
   const plan = benchOrder(rounds);
   for (const [i, w] of plan.entries()) {
     $('benchStatus').textContent = `Benchmark ${i + 1}/${plan.length}: ${w.mode === 'full' ? 'normal playback' : 'tiled'} (round ${w.round}) — don't touch the mouse`;
-    if (!(await setMode(w.mode))) { $('benchStatus').textContent = `Benchmark stopped at ${i + 1}/${plan.length}: a video did not load.`; return; }
+    if (!(await setMode(w.mode))) { await benchAbort(`Benchmark stopped at ${i + 1}/${plan.length}: a video did not load.`); return; }
     tourSpeed = Number(params.get('speed')) || 0.5; tourOn = true; tourT = 0;
     await sleep(settle * 1000);                 // let decoders start and tiles join before measuring
     perfStart({ mode: w.mode, round: w.round });
@@ -454,8 +475,11 @@ async function runBenchInner() {
   };
   window.__benchResult = result;
   $('benchStatus').textContent = 'Benchmark finished.';
-  try { await fetch('/__perf', { method: 'POST', body: JSON.stringify(result) }); $('benchStatus').textContent += ' Results sent to the local analyzer.'; }
-  catch { $('benchStatus').textContent += ' (no analyzer running; use the download link)'; }
+  try {
+    const r = await fetch('/__perf', { method: 'POST', body: JSON.stringify(result) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    $('benchStatus').textContent += ' Results sent to the local analyzer.';
+  } catch { $('benchStatus').textContent += ' (no analyzer accepted the results; use the download link)'; }
   showBench(result);
 }
 

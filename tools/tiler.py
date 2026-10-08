@@ -39,11 +39,18 @@ def run(cmd):
 
 def probe(path):
     out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-               "stream=width,height,r_frame_rate:format=duration", "-of", "json", path])
+               "stream=width,height,r_frame_rate,avg_frame_rate:format=duration", "-of", "json", path])
     j = json.loads(out)
     s = j["streams"][0]
-    num, den = s["r_frame_rate"].split("/")
-    return s["width"], s["height"], float(num) / float(den), float(j["format"]["duration"])
+    fps = 0.0
+    for key in ("r_frame_rate", "avg_frame_rate"):          # r_frame_rate can be 0/0 for some containers
+        num, _, den = s.get(key, "0/0").partition("/")
+        if float(den or 1) and float(num) > 0:
+            fps = float(num) / float(den or 1)
+            break
+    if fps <= 0:
+        raise ValueError("cannot determine the frame rate of %s" % path)
+    return s["width"], s["height"], fps, float(j["format"]["duration"])
 
 
 def has_audio(path):
@@ -120,9 +127,16 @@ def fingerprint(args, width, height, fps):
 
 def _remove_managed(out):
     """Deletes only the files this tool writes, never anything else that happens to be in the directory."""
-    for pattern in ("tiles/*.mp4", "tiles/*.part", "base.mp4", "base.mp4.part", "manifest.json", STATE_FILE):
-        for f in glob.glob(os.path.join(out, pattern)):
+    for pattern in ("tiles/*.mp4", "tiles/*.part", "base.mp4", "base.mp4.part", "manifest.json", STATE_FILE, STATE_FILE + ".part"):
+        for f in glob.glob(os.path.join(glob.escape(out), pattern)):      # escape: the folder name may contain [ ] * ?
             os.remove(f)
+
+
+def _write_json_atomic(path, obj, **kw):
+    """Write then rename, so a crash can never leave a half-written (and therefore 'unknown') state or manifest."""
+    with open(path + ".part", "w") as f:
+        json.dump(obj, f, **kw)
+    os.replace(path + ".part", path)
 
 
 def _load_json(path):
@@ -176,7 +190,7 @@ def build(args):
         _remove_managed(args.output)
         state = None
     else:
-        for f in glob.glob(os.path.join(args.output, "**", "*.part"), recursive=True):
+        for f in glob.glob(os.path.join(glob.escape(args.output), "**", "*.part"), recursive=True):
             os.remove(f)                                    # half-written output of an interrupted run
     manifest_path = os.path.join(args.output, "manifest.json")
     args.reused = False
@@ -187,8 +201,7 @@ def build(args):
             if all(os.path.isfile(x) and os.path.getsize(x) > 0 for x in paths):
                 args.reused = True
                 return existing
-    with open(os.path.join(args.output, STATE_FILE), "w") as f:
-        json.dump({"config": fp, "complete": False, "started": time.strftime("%Y-%m-%dT%H:%M:%S")}, f)
+    _write_json_atomic(os.path.join(args.output, STATE_FILE), {"config": fp, "complete": False, "started": time.strftime("%Y-%m-%dT%H:%M:%S")})
 
     tile_bitrate = args.tile_bitrate_k or max(200, int(args.bitrate_k * (cw * ch) / (width * height) * 1.0))
     gov = resources.Governor(headroom=args.headroom, reserve_mem_mb=args.reserve_mem_mb, max_jobs=args.max_jobs) \
@@ -260,11 +273,8 @@ def build(args):
         "tiles": [{"row": r, "col": c, "file": "tiles/t_%d_%d.mp4" % (r, c)}
                   for r in range(args.rows) for c in range(args.cols)],
     }
-    with open(manifest_path + ".part", "w") as f:
-        json.dump(manifest, f, indent=2)
-    os.replace(manifest_path + ".part", manifest_path)
-    with open(os.path.join(args.output, STATE_FILE), "w") as f:
-        json.dump({"config": fp, "complete": True, "built": time.strftime("%Y-%m-%dT%H:%M:%S")}, f)
+    _write_json_atomic(manifest_path, manifest, indent=2)
+    _write_json_atomic(os.path.join(args.output, STATE_FILE), {"config": fp, "complete": True, "built": time.strftime("%Y-%m-%dT%H:%M:%S")})
     return manifest
 
 
@@ -299,6 +309,9 @@ def main(argv=None):
         m = build(args)
     except (ValueError, RuntimeError) as e:
         print("error:", e, file=sys.stderr)
+        return 1
+    except FileNotFoundError as e:                               # ffmpeg/ffprobe missing from PATH (or the input file)
+        print("error: %s not found. Install ffmpeg (it provides ffprobe) and make sure it is on your PATH." % (e.filename or "a required program"), file=sys.stderr)
         return 1
     print(("tileset already built, reusing %s" if getattr(args, "reused", False) else "wrote %d tiles + base to %s")
           % ((args.output,) if getattr(args, "reused", False) else (len(m["tiles"]), args.output)))

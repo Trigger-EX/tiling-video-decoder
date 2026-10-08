@@ -176,6 +176,13 @@ range request with at most 1 MB (`TILING_MAX_CHUNK`, 0 = unlimited); the browser
 Measured on a 150 s test clip with 16 tiles: 2-4 of 16 tiles drawn and 2.2 s joins before, 13-16 of 16 and 0.4 s
 joins after. If you serve a tileset from your own web server, make it do the same (or use HTTP/2).
 
+### Comparing runs fairly
+
+Use `python3 demo/run_demo.py --analyze`: it opens a fresh page for every benchmark. Pressing **Run benchmark**
+repeatedly inside one page works (it no longer hangs or refuses to run again), but in my testing the first run in a
+page was consistently the best (about 99% of the view drawn), with later runs about 15% lower; I could not tell whether
+that is the browser's media cache or my sandbox's software rendering, so don't compare a first run with a fifth.
+
 ## How it runs on the headset
 
 1. `base.mp4` plays in the existing `ExoVideoPlayer`: it owns the audio and is the master clock (`MediaClock` wraps its position; bump `epoch` on every seek, load and loop).
