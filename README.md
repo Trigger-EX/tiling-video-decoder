@@ -146,7 +146,7 @@ showed. The viewer now handles that in `demo/slotsync.js` (pure logic, unit-test
   frame while paused, and starts playing when the clock arrives. The lead is learned from real join times (it rises
   at once on a slow join and falls over a few fast ones), so fast machines see no delay and slow ones stop chasing.
 * **Join pacing.** Only a few tiles start at once (more while things are calm), most important first.
-* **Adaptive decoder limit.** If tiles stall (the decoder produces nothing for 4 s) or keep arriving late, the
+* **Adaptive decoder limit (off by default; tick "Adapt decoder count to load").** If tiles stall (the decoder produces nothing for 4 s) or keep arriving late, the
   effective decoder limit drops below your slider setting, and probes back up slowly, waiting longer after each failed
   probe. The panel shows "limited to N" and the benchmark report says so, so a run that was throttled can't pass
   for one that wasn't.
@@ -163,6 +163,18 @@ Measured in a software-rendered Chromium on 4 cores with the browser pinned to f
 Treat these as a demonstration of the failure mode and the fix, not as speeds: this machine decodes VP9 in software,
 not your HEVC. "Join time" in the viewer and the benchmark now includes the deliberate hold, so it is not comparable
 with numbers from before this change.
+
+### Why the demo server cuts range responses
+
+Browsers allow only about six simultaneous connections to one server. A browser asks for `bytes=N-` (the rest of the
+file) and reads it only as fast as it plays, so an answer that really sends the rest of the file keeps a connection
+open for as long as the `<video>` exists. With a dozen tile videos, the base layer and the original video all
+streaming, they used every connection and everything else waited forever: tiles stuck on "joining" with only a couple
+working, a benchmark that hung, and a "needs the original video" error. It only shows with videos longer than the
+browser's read-ahead (short test clips fit in one read, so they never showed it). `demo/serve.py` now answers each
+range request with at most 1 MB (`TILING_MAX_CHUNK`, 0 = unlimited); the browser asks again when it needs more.
+Measured on a 150 s test clip with 16 tiles: 2-4 of 16 tiles drawn and 2.2 s joins before, 13-16 of 16 and 0.4 s
+joins after. If you serve a tileset from your own web server, make it do the same (or use HTTP/2).
 
 ## How it runs on the headset
 

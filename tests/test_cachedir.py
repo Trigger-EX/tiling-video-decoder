@@ -82,5 +82,54 @@ class MountTest(unittest.TestCase):
                 srv.shutdown(); srv.server_close()
 
 
+class RangeCapTest(unittest.TestCase):
+    """A range request must never be answered with the whole rest of a big file: that response stays open as long as
+    the <video> exists and, with ~6 connections per server, a dozen tile videos would starve every other request."""
+
+    def serve(self, web, limit):
+        self.old, serve.MAX_CHUNK = serve.MAX_CHUNK, limit
+        srv = serve.make_server(web, 0)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, "http://127.0.0.1:%d/v.mp4" % srv.server_address[1]
+
+    def test_open_ended_range_is_cut_to_the_chunk_limit_and_reassembles(self):
+        with tempfile.TemporaryDirectory() as web:
+            data = bytes(i % 251 for i in range(5000))
+            with open(os.path.join(web, "v.mp4"), "wb") as f:
+                f.write(data)
+            srv, url = self.serve(web, 2000)
+            try:
+                got, pos, requests = b"", 0, 0
+                while pos < len(data):
+                    r = urllib.request.urlopen(urllib.request.Request(url, headers={"Range": "bytes=%d-" % pos}))
+                    body = r.read()
+                    span, total = r.headers["Content-Range"].split(" ")[1].split("/")
+                    self.assertEqual((r.status, int(total)), (206, 5000))
+                    self.assertEqual(int(span.split("-")[0]), pos)
+                    self.assertLessEqual(len(body), 2000)
+                    self.assertEqual(int(r.headers["Content-Length"]), len(body))
+                    got, pos, requests = got + body, pos + len(body), requests + 1
+                self.assertEqual(got, data)
+                self.assertEqual(requests, 3)                                  # 2000 + 2000 + 1000
+                r = urllib.request.urlopen(urllib.request.Request(url, headers={"Range": "bytes=10-19"}))
+                self.assertEqual(r.read(), data[10:20])                         # small explicit ranges are untouched
+                self.assertEqual(urllib.request.urlopen(url).read(), data)      # a plain GET still returns the whole file
+            finally:
+                serve.MAX_CHUNK = self.old
+                srv.shutdown(); srv.server_close()
+
+    def test_limit_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as web:
+            with open(os.path.join(web, "v.mp4"), "wb") as f:
+                f.write(b"x" * 3000)
+            srv, url = self.serve(web, 0)
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(url, headers={"Range": "bytes=0-"}))
+                self.assertEqual(len(r.read()), 3000)
+            finally:
+                serve.MAX_CHUNK = self.old
+                srv.shutdown(); srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()
